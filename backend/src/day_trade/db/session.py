@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from functools import lru_cache
 from typing import Any
@@ -61,6 +62,7 @@ def _session_factory() -> async_sessionmaker[AsyncSession]:
     )
 
 
+@asynccontextmanager
 async def session_scope() -> AsyncIterator[AsyncSession]:
     """Use as an async context: `async with session_scope() as s:`.
 
