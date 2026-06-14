@@ -1,0 +1,61 @@
+[project]
+name = "day-trade"
+version = "0.1.0"
+description = "Local Mac-only AI-assisted day-momentum trading copilot built on Day Trade Dash + IBKR paper"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30.0",
+    "psycopg2-binary>=2.9.10",
+    "alembic>=1.14.0",
+    "playwright>=1.49.0",
+    "ib-async>=1.0.3",
+    "httpx>=0.28.0",
+    "python-dotenv>=1.0.1",
+    "structlog>=24.4.0",
+    "orjson>=3.10.0",
+    "anyio>=4.6.0",
+    "websockets>=13.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+    "httpx>=0.28.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/day_trade"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "SIM"]
+# B008: FastAPI convention is Query/Depends in defaults.
+# ASYNC240: a single mkdir at process start is fine; not worth pulling in anyio.
+# SIM103/SIM108: cosmetic; the explicit forms are easier to read in places.
+ignore = ["E501", "B008", "ASYNC240", "SIM103", "SIM108"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.12"
+strict_optional = true
+ignore_missing_imports = true

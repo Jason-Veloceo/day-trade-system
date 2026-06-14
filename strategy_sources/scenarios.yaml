@@ -1,0 +1,517 @@
+# Ross / Warrior - structured scenario catalogue
+#
+# Companion to principles.md. Each record is a stimulus -> response
+# scenario captured from a source (today: Warrior trading course Q&A).
+# The engine (and a future LLM reasoner) can pattern-match the live
+# situation against this catalogue and surface the matching scenario's
+# response + principle to the user.
+#
+# Schema rules:
+#   - Every scenario has a stable, kebab-case `id`.
+#   - Every scenario has a `source` so we can prove provenance.
+#   - `stimulus` is the observable preconditions: what the live market
+#     would need to look like for this scenario to match.
+#   - `response.action` is the action vocabulary, see
+#     `valid_response_actions` below.
+#   - `engine_use` documents how the deterministic + LLM layers consume
+#     this scenario.
+#   - `principle_refs` link to PRINCIPLE_IDs in principles.md.
+#   - `status` mirrors assumptions_register.md vocabulary.
+
+meta:
+  version: 0.1.0
+  status: scaffold
+  last_reviewed_at: 2026-06-14
+  reviewer: jason
+  source_of_truth: principles.md
+  notes: |
+    Initial ingest of 16 Warrior course Q&A captured from screenshots
+    on 2026-06-14. Every scenario points at one or more principles in
+    principles.md. Engine code does NOT yet consume this file - it is
+    the corpus we will load into the LLM reasoner once that layer is
+    built, and the basis for future soft-score features.
+
+valid_response_actions:
+  - watch
+  - take_starter_position
+  - take_full_position
+  - scale_up
+  - scale_out_partial
+  - exit_all
+  - block_entry
+  - block_entry_soft  # soft block -> route to manual approval
+  - no_action_informational
+  - apply_score_adjustment
+
+# ---------------------------------------------------------------------
+# P0. Golden rule
+# ---------------------------------------------------------------------
+scenarios:
+
+  - id: minimize_losers
+    category: risk_psychology
+    source:
+      type: warrior_course_q
+      reference: "TF Q - 'primary goal is to minimise losers' = TRUE"
+      asset: assets/image-389272f7-0708-4c01-960f-070fcdbe72f6.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      always_matches: true
+    response:
+      action: no_action_informational
+      reasoning: |
+        The primary goal is to minimise losers, not maximise winners.
+        This is the framing the engine should surface to the user on
+        every approve / block / exit screen.
+    principle_refs:
+      - GOLDEN_RULE_MINIMIZE_LOSERS
+    engine_use:
+      hard_rule: false
+      soft_score_input: false
+      surface_to_user: true
+      surface_location: "header banner on /engine page; quoted in every approval / block dialog"
+
+# ---------------------------------------------------------------------
+# P1. Entry timing
+# ---------------------------------------------------------------------
+
+  - id: bull_flag_starter_below_psych_level_with_green_ts
+    category: entry_timing
+    source:
+      type: warrior_course_q
+      reference: "Q5.37 - bull flag forming, entry/apex known (5.52), green T&S volume at 5.47"
+      asset: assets/image-dedd4935-3f12-4568-8b59-cd4ee4fb7eea.png
+      captured_at: 2026-06-14
+    status: needs_validation
+    stimulus:
+      pattern: bull_flag_forming
+      knowns:
+        - entry_price        # the "first candle to make new high" trigger price (e.g. 5.52)
+        - apex_price         # the resistance / apex of the flag (e.g. 5.52)
+      observation:
+        - ts_recent_buy_volume_concentrated_below_psych_level
+        - distance_to_psych_level_cents_lte: 5
+        - distance_to_entry_cents_lte: 7
+    response:
+      action: take_starter_position
+      reasoning: |
+        Volume right below the half-dollar (psychological level) often
+        results in a break of that level, and once broken can surge
+        through to the apex / next breakout point. A starter at the
+        psych level gives you exposure before the break with defined
+        risk (stop just below the psych level).
+      starter_sizing_hint: "fraction of full size, e.g. 25-33%"
+    principle_refs:
+      - STARTER_THEN_SCALE_UP_THEN_MANAGE_OUT
+      - GREEN_TS_VOLUME_BELOW_PSYCH_LEVEL_IS_PRE_BREAK_SIGNAL
+      - PSYCH_LEVEL_MAGNETS
+    engine_use:
+      hard_rule: false
+      soft_score_input: true
+      soft_score_input_name: starter_signal_strength
+      surface_to_user: true
+      requires_engine_extension:
+        - multi_leg_position_support       # see P1 starter principle
+        - psych_level_detection_per_symbol
+
+  - id: first_1m_candle_new_high_after_micro_pullback
+    category: entry_timing
+    source:
+      type: synthesised
+      reference: |
+        Implicit in Warrior public material on bull flag / first
+        pullback / micro pullback; matches Jason's direct NVFY example
+        2026-06-14 (look at the smaller of the recent red candles, enter
+        when the next green's high exceeds it - e.g. 3.73).
+      captured_at: 2026-06-14
+    status: validated  # implemented as engine/triggers.py::detect_pullback_break
+    stimulus:
+      pattern: micro_or_first_pullback
+      observation:
+        - recent_red_run_length_in: [1, 2, 3]
+        - max_bars_since_pullback_end_lte: 3
+        - prior_green_impulse_bars_gte: 1
+        - current_bar_green: true
+        - current_bar_high_gt_last_red_high: true
+    response:
+      action: take_full_position
+      reasoning: |
+        Canonical Ross structural break. The "smaller / more recent"
+        red bar in the pullback is the test; the first green candle
+        whose HIGH exceeds that test high is the entry. Stop goes
+        below the pullback low.
+      stop_hint: pullback_low_minus_buffer
+    principle_refs:
+      - FIRST_CANDLE_NEW_HIGH_AFTER_PULLBACK_1M
+      - MIN_TWO_TIMEFRAMES
+    engine_use:
+      hard_rule: true
+      implemented_in:
+        - "backend/src/day_trade/engine/triggers.py::detect_pullback_break"
+        - "backend/src/day_trade/engine/strategies/first_pullback_long.py"
+      surface_to_user: true
+
+  - id: layered_entries_during_sustained_uptrend
+    category: position_management
+    source:
+      type: warrior_course_q
+      reference: "PRGN chart - 3 marked entries: (1) first 1m pullback after HOD scanner, (2) first 5m bull flag, (3) first 5m candle to make new high"
+      asset: assets/image-31a778be-08b7-4ac5-bdb3-f7f0027306b9.png
+      captured_at: 2026-06-14
+    status: needs_validation
+    stimulus:
+      pattern: continuation_after_open_run
+      observation:
+        - existing_uptrend_on_session: true
+        - prior_winning_leg_on_symbol: any
+    response:
+      action: scale_up
+      reasoning: |
+        Multiple sequential entries on the same symbol in the same
+        session are normal and expected when the trend is intact.
+        The engine's auto-rearm behaviour after every exit is the
+        right default. The 5m sub-setups (flag / new-high) noted in
+        the PRGN chart are PARKED for v1.1 (1m primary). The 1m
+        first-pullback re-entry is supported.
+    principle_refs:
+      - LAYERED_ENTRIES_DURING_SUSTAINED_UPTREND
+      - STARTER_THEN_SCALE_UP_THEN_MANAGE_OUT
+    engine_use:
+      hard_rule: false
+      soft_score_input: false
+      surface_to_user: true
+      partial_implementation:
+        - "engine auto-rearm after each exit (FirstPullbackLong v1.1)"
+      requires_engine_extension:
+        - multi_leg_position_support  # for true within-position scaling
+
+  - id: first_5m_candle_new_high
+    category: entry_timing
+    source:
+      type: warrior_course_q
+      reference: "AKER chart - correct entry = first 5m candle to make new high at ~2.78"
+      asset: assets/image-11e5e060-50b9-4609-8457-eeeb3e1b8b52.png
+      captured_at: 2026-06-14
+    status: parked
+    stimulus:
+      pattern: first_5m_candle_new_high
+    response:
+      action: no_action_informational
+      reasoning: |
+        PARKED per Jason 2026-06-14 - Ross trades almost exclusively
+        on the 1m chart. Record for future reference when extending
+        the engine to longer-hold continuations.
+    principle_refs:
+      - PARKED__FIRST_5M_CANDLE_NEW_HIGH_SETUP
+    engine_use:
+      hard_rule: false
+      surface_to_user: false
+
+# ---------------------------------------------------------------------
+# P2. Psychological levels
+# ---------------------------------------------------------------------
+
+  - id: large_bid_at_psych_level_is_support
+    category: l2_reading
+    source:
+      type: warrior_course_q
+      reference: "Q '25k buyer on bid' = sign of strength; PULM image with 34k bid creating psychological support"
+      assets:
+        - assets/image-58e046b6-268b-47c8-be6a-b1653a145036.png
+        - assets/image-fa727340-669e-4d04-84e8-90189f42f036.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      observation:
+        - top_n_bid_size_max_multiple_of_median_gte: 5
+        - distance_to_psych_level_cents_lte: 3       # bid near a half/whole dollar
+    response:
+      action: apply_score_adjustment
+      reasoning: |
+        A bid size meaningfully larger than the rest of the book at
+        or near a psychological level acts as support. Bullish.
+      score_delta_hint: positive
+    principle_refs:
+      - BIG_BID_IS_SUPPORT
+      - PSYCH_LEVEL_MAGNETS
+    engine_use:
+      hard_rule: false
+      soft_score_input: true
+      surface_to_user: true
+      requires_engine_extension:
+        - psych_level_detection_per_symbol
+        - top_n_book_size_multiplier_feature
+
+  - id: next_visible_bid_is_next_support
+    category: l2_reading_stop_placement
+    source:
+      type: warrior_course_q
+      reference: "CHFS L2 image - 'if stock drops below 20.55, where will it likely drop to?' = 20.40 (next visible bid level)"
+      asset: assets/image-eafc6cba-9ea6-4c7f-b2d9-5ce5f331c9c6.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      observation:
+        - depth_subscription_active: true
+        - chart_low_within_book_window: true
+    response:
+      action: apply_score_adjustment
+      reasoning: |
+        When a visible bid level breaks, expect price to drop to the
+        NEXT visible bid level. Stops should be set just below the
+        nearest meaningful visible bid, not (only) below the chart
+        low. Especially relevant when the chart low and the nearest
+        visible bid disagree by more than the stop_buffer.
+    principle_refs:
+      - NEXT_VISIBLE_BID_IS_NEXT_SUPPORT
+    engine_use:
+      hard_rule: false
+      soft_score_input: false
+      surface_to_user: true
+      future_work: |
+        Adjust suggest_stop_price() to consult the L2 book when
+        enable_depth=true: prefer max(pullback_low_minus_buffer,
+        nearest_meaningful_visible_bid_minus_1c) as the stop, and
+        journal which rule wins.
+
+# ---------------------------------------------------------------------
+# P3. L2 reading - soft / advisory
+# ---------------------------------------------------------------------
+
+  - id: large_ask_might_be_iceberg
+    category: l2_reading
+    source:
+      type: warrior_course_q
+      reference: "Q '25k seller on ask interpretation' = larger seller, possibly iceberg"
+      asset: assets/image-dfef3685-80dc-447a-bfda-1ad812078d2a.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      observation:
+        - top_n_ask_size_max_multiple_of_median_gte: 5
+        - distance_to_current_price_cents_lte: 10
+    response:
+      action: apply_score_adjustment
+      reasoning: |
+        Visible big ask is informative but NOT conclusive. May be a
+        real wall, an iceberg fragment, or a spoof. Apply a soft-
+        score PENALTY proportional to size; do NOT hard-block.
+      score_delta_hint: negative
+    principle_refs:
+      - BIG_ASK_MAYBE_ICEBERG
+    engine_use:
+      hard_rule: false
+      soft_score_input: true
+      surface_to_user: true
+      partial_implementation:
+        - "features.ask_wall_price / ask_wall_size / ask_wall_distance_bps"
+
+  - id: l2_enables_three_edges
+    category: l2_framing
+    source:
+      type: warrior_course_q
+      reference: "Q 'Ability to read L2 will allow you to...' = all"
+      asset: assets/image-62176d12-4b5c-4de3-b663-bcb9a7b30ee9.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      always_matches_when: depth_subscription_active
+    response:
+      action: no_action_informational
+      reasoning: |
+        L2 enables three actionable edges:
+          1. Determine psychological S / R levels.
+          2. Identify low-risk entry points.
+          3. Capture quick profits on the break of critical levels.
+        UX TODO: label each L2 snapshot in the live features panel
+        with which of the three edges it currently supports.
+    principle_refs:
+      - L2_ENABLES_THREE_EDGES
+    engine_use:
+      hard_rule: false
+      surface_to_user: true
+
+  - id: l2_is_multi_dimensional
+    category: l2_framing
+    source:
+      type: warrior_course_q
+      reference: "Q 'Why is Level 2 important?' = all (depth, lined-up buyers/sellers, big buyers/sellers nearby, thick vs thin)"
+      asset: assets/image-de3e9ea8-9287-4e4b-bccf-9124220eb1fb.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      always_matches_when: depth_subscription_active
+    response:
+      action: no_action_informational
+      reasoning: |
+        Read L2 across all four dimensions. The engine's live features
+        panel already exposes spread / imbalance / walls / sizes.
+    principle_refs:
+      - L2_IS_MULTI_DIMENSIONAL
+    engine_use:
+      hard_rule: false
+      surface_to_user: true
+
+  - id: l1_top_of_book_informational
+    category: l1_framing
+    source:
+      type: warrior_course_q
+      reference: "Q 'Level 1 Top of Book describes...' = all (best price per route, halt resume price, more affordable, LULD)"
+      asset: assets/image-6f357534-6962-48b3-a0b4-8341ddad40e6.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      always_matches_when: l1_subscription_active
+    response:
+      action: no_action_informational
+      reasoning: |
+        L1 = NBBO fallback when L2 unavailable (forex, no-sub mode).
+        Best price per route, halt up/down (LULD) when applicable.
+    principle_refs:
+      - L1_INFORMATIONAL_FALLBACK
+    engine_use:
+      hard_rule: false
+      surface_to_user: false
+
+# ---------------------------------------------------------------------
+# P4. T&S reading
+# ---------------------------------------------------------------------
+
+  - id: big_green_burst_is_strength
+    category: ts_reading
+    source:
+      type: warrior_course_q
+      reference: "Q 'burst of large green orders on tape' = shows strength regardless of short cover or new buyers"
+      asset: assets/image-76d86d7e-01d3-4cbd-8a3b-7b113667519e.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      observation:
+        - tape_subscription_active: true
+        - tape_burst_large_print_count_30s_gte: 3
+        - tape_burst_classified_buy: true
+    response:
+      action: apply_score_adjustment
+      reasoning: |
+        Big green prints = strength, regardless of intent (short cover
+        vs new long). Buying is buying.
+      score_delta_hint: positive
+    principle_refs:
+      - BIG_GREEN_BURST_IS_STRENGTH
+      - DONT_DISTINGUISH_INTENT_ON_THE_TAPE
+    engine_use:
+      hard_rule: false
+      soft_score_input: true
+      surface_to_user: true
+      partial_implementation:
+        - "features.tape_buy_pct_60s already captures sustained buy share"
+      future_work: |
+        Add a `tape_big_green_burst_30s` boolean: count prints in last
+        30s whose size >= Nx median print size AND classified buy.
+        Surface as a +score input.
+
+  - id: ts_represents_every_execution
+    category: ts_framing
+    source:
+      type: warrior_course_q
+      reference: "Q 'What does T&S represent?' = all (each order, at bid, at ask, timestamp)"
+      asset: assets/image-96ea44af-b46d-4ca0-af32-5e2e92f57a13.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      always_matches_when: tape_subscription_active
+    response:
+      action: no_action_informational
+      reasoning: |
+        T&S is every execution + bid/ask classification + timestamp.
+        Already reflected in our subscribe_tape(reqTickByTickData,
+        'AllLast') pipeline.
+    principle_refs:
+      - TS_REPRESENTS_EVERY_EXECUTION
+    engine_use:
+      hard_rule: false
+      surface_to_user: false
+
+# ---------------------------------------------------------------------
+# P5. Multi-timeframe
+# ---------------------------------------------------------------------
+
+  - id: minimum_two_timeframes_before_trade
+    category: timeframe_doctrine
+    source:
+      type: warrior_course_q
+      reference: "Q 'How many time frames should an active trader review before taking a trade?' = at least 2"
+      asset: assets/image-5ea70271-e7db-478a-8c12-2e2d21851e95.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      always_matches: true
+    response:
+      action: no_action_informational
+      reasoning: |
+        At least 2 timeframes - we satisfy this with 1m (entry) +
+        5m (trend context) in FirstPullbackLong.
+    principle_refs:
+      - MIN_TWO_TIMEFRAMES
+    engine_use:
+      hard_rule: true   # already enforced by the 5m MACD gate
+      implemented_in:
+        - "engine/multitf.py + first_pullback_long.on_5m_bar"
+      surface_to_user: false
+
+  - id: hold_above_5m_9_ema_PARKED
+    category: trend_filter
+    source:
+      type: warrior_course_q
+      reference: "Q 'stocks hold above which MA on the 5-min chart?' = 9 EMA"
+      asset: assets/image-3a80fb87-5a66-4d02-ad75-1cc974313e3f.png
+      captured_at: 2026-06-14
+    status: parked
+    stimulus:
+      pattern: in_position_long_holding_runner
+    response:
+      action: no_action_informational
+      reasoning: |
+        PARKED per Jason 2026-06-14 - Ross trades almost exclusively
+        on the 1m. The 5m 9 EMA hold-line is a Warrior teaching point
+        for runners; revisit when we add multi-bar hold logic.
+    principle_refs:
+      - PARKED__HOLD_ABOVE_9_EMA_5M
+    engine_use:
+      hard_rule: false
+      surface_to_user: false
+
+# ---------------------------------------------------------------------
+# P7. Risk management
+# ---------------------------------------------------------------------
+
+  - id: three_loss_caps
+    category: risk_psychology
+    source:
+      type: warrior_course_q
+      reference: "Q 'A trader's set of rules should include' = all (max loss/day, max loss/trade, max consecutive losses)"
+      asset: assets/image-65f2e99f-129b-45f7-9d0e-ab8340159483.png
+      captured_at: 2026-06-14
+    status: validated
+    stimulus:
+      always_matches: true
+    response:
+      action: no_action_informational
+      reasoning: |
+        Three loss caps:
+          - max loss per day (HARD, enforced)
+          - max loss per trade (HARD, enforced via stop + sizing)
+          - max consecutive losses (TRACKED ONLY for v1.1 paper;
+            decision pending on whether to enforce)
+    principle_refs:
+      - THREE_LOSS_CAPS
+    engine_use:
+      hard_rule: partial
+      surface_to_user: true
+      tracked_only_today:
+        - consecutive_losses_count
+      future_decision: |
+        After paper-trading enough sample, decide:
+          (a) Enforce auto-pause at N consecutive losses (paper or live).
+          (b) Surface only.

@@ -1,0 +1,556 @@
+# Ross-inspired small-cap momentum strategy spec.
+#
+# Every value in this file is one of:
+#   - ASSUMPTION       : placeholder taken from ChatGPT's scaffold or my best guess
+#   - PLACEHOLDER      : known shape, value not yet meaningful
+#   - NEEDS_VALIDATION : value present but not yet traced to a source
+#   - VALIDATED        : traced to a Ross/Warrior source recorded in
+#                        assumptions_register.md and ross_notes.md
+#
+# Until a value is VALIDATED, the strategy engine should treat it as untrusted.
+# Do NOT promote this strategy to autonomous trading on the basis of these
+# values alone.
+#
+# The runtime engine loads this file via the strategy spec loader, which
+# rejects any spec where a hard-required field is missing.
+
+meta:
+  version: 0.2.0                      # schema version of this file
+  status: scaffold                    # scaffold | review | active
+  source_of_truth: ross_notes.md
+  companion_files:
+    principles: principles.md         # narrative Ross-style heuristics
+    scenarios: scenarios.yaml         # structured stimulus -> response catalogue
+  last_reviewed_at: 2026-06-14
+  reviewer: jason
+  notes: |
+    Initial scaffold from ChatGPT's Ross-inspired seed values plus the
+    framework requested in ross_notes.md. Sections 13-17 added 2026-06-14
+    after Warrior course Q&A ingest - all values there are documented
+    placeholders for future engine work, NOT active rules.
+
+    NOTHING in this file has been confirmed against Ross's published
+    material yet. Treat every threshold as a placeholder until promoted
+    to VALIDATED in assumptions_register.md.
+
+# ---------------------------------------------------------------------------
+# 1. Universe filters
+# ---------------------------------------------------------------------------
+universe:
+  min_price: 1.00                      # ASSUMPTION
+  max_price: 20.00                     # ASSUMPTION
+  min_gap_percent: 10                  # ASSUMPTION
+  min_relative_volume: 5               # ASSUMPTION (vs daily average)
+  max_float_millions: 20               # ASSUMPTION
+  min_volume: 500000                   # ASSUMPTION (cumulative day volume)
+  min_dollar_volume: null              # PLACEHOLDER
+  max_spread_percent: 1.5              # ASSUMPTION
+  min_catalyst_score: null             # PLACEHOLDER
+  allowed_exchanges:                   # ASSUMPTION
+    - NASDAQ
+    - NYSE
+    - AMEX
+  require_news_or_catalyst: false      # ASSUMPTION
+  exclude_etfs: true                   # ASSUMPTION
+  exclude_warrants: true               # ASSUMPTION
+  exclude_low_liquidity: true          # ASSUMPTION
+  exclude_active_halts: true           # ASSUMPTION
+
+# ---------------------------------------------------------------------------
+# 2. Market regime
+#    Determines how aggressive the system is allowed to be on a given day.
+#    Regime gates max risk, max size, target multiples, and aggressiveness.
+# ---------------------------------------------------------------------------
+market_regime:
+  default: normal_market               # ASSUMPTION
+  regimes:
+    cold_market:
+      criteria: |
+        PLACEHOLDER - typically: few gappers, low overall small-cap volume,
+        prior-day high count of strong movers below a threshold.
+      max_risk_multiplier: 0.5         # ASSUMPTION
+      max_size_multiplier: 0.5         # ASSUMPTION
+      target_multiple: 1.5             # ASSUMPTION (reward:risk floor)
+      aggressiveness: low              # ASSUMPTION
+    normal_market:
+      criteria: PLACEHOLDER
+      max_risk_multiplier: 1.0
+      max_size_multiplier: 1.0
+      target_multiple: 2.0             # ASSUMPTION
+      aggressiveness: medium
+    hot_market:
+      criteria: |
+        PLACEHOLDER - heavy gappers, multiple strong movers, prior days
+        had multi-100% running stocks.
+      max_risk_multiplier: 1.5         # ASSUMPTION
+      max_size_multiplier: 1.25        # ASSUMPTION
+      target_multiple: 2.5             # ASSUMPTION
+      aggressiveness: high             # ASSUMPTION
+
+# ---------------------------------------------------------------------------
+# 3. Setup definitions
+# ---------------------------------------------------------------------------
+setups:
+
+  bull_flag:
+    enabled: true
+    description: |
+      Strong impulse up followed by a brief pullback / consolidation,
+      then entry on the first candle to make a new high after the pullback.
+    chart_timeframe: 1m                # ASSUMPTION
+    preconditions:                     # ASSUMPTION
+      - above_vwap
+      - rel_vol_today_at_or_above: 3
+      - first_hour_of_session: prefer
+    pattern_detection:
+      required_impulse_percent: 5      # ASSUMPTION
+      pullback_min_bars: 2             # ASSUMPTION
+      pullback_max_bars: 5             # ASSUMPTION
+      max_pullback_percent_of_impulse: 50  # ASSUMPTION
+    entry_trigger: first_candle_to_make_new_high_after_pullback
+    invalid_entry_trigger: chase_after_breakout_by_more_than_n_cents
+    stop_rule: below_pullback_low
+    first_target: VALIDATED_PLACEHOLDER
+    second_target: VALIDATED_PLACEHOLDER
+    scale_out_logic: |
+      PLACEHOLDER - typical Ross logic is partial at first target then trail.
+    trailing_stop_logic: trail_to_breakeven_after_first_target  # ASSUMPTION
+    disqualification:                  # ASSUMPTION
+      - spread_wider_than_max
+      - choppy_action_in_last_n_bars
+      - failed_breakout_recently
+    min_reward_risk: 2.0               # ASSUMPTION
+
+  first_pullback:
+    enabled: true
+    description: |
+      The first meaningful pullback off a strong opening move. Entry on
+      continuation after the pullback.
+    chart_timeframe: 1m
+    preconditions:                     # PLACEHOLDER
+      - strong_open_move
+      - above_vwap
+    pattern_detection: PLACEHOLDER
+    entry_trigger: PLACEHOLDER
+    invalid_entry_trigger: PLACEHOLDER
+    stop_rule: PLACEHOLDER
+    first_target: PLACEHOLDER
+    second_target: PLACEHOLDER
+    scale_out_logic: PLACEHOLDER
+    trailing_stop_logic: PLACEHOLDER
+    disqualification: PLACEHOLDER
+    min_reward_risk: 2.0               # ASSUMPTION
+
+  micro_pullback:
+    enabled: true
+    description: |
+      Strong active momentum with a shallow pullback on a very short
+      timeframe, continuation entry as momentum resumes.
+    chart_timeframe: 1m
+    timeframes:                        # ASSUMPTION
+      - 10s
+      - 1m
+    preconditions:
+      require_strong_momentum: true    # ASSUMPTION
+    pattern_detection:
+      max_pullback_bars: 3             # ASSUMPTION
+    entry_trigger: reclaim_of_micro_pullback_high
+    invalid_entry_trigger: deeper_than_micro_pullback_definition
+    stop_rule: below_micro_pullback_low
+    first_target: PLACEHOLDER
+    second_target: PLACEHOLDER
+    scale_out_logic: PLACEHOLDER
+    trailing_stop_logic: PLACEHOLDER
+    disqualification: PLACEHOLDER
+    min_reward_risk: 1.5               # ASSUMPTION
+
+  flat_top_breakout:
+    enabled: true
+    description: |
+      Multiple tests of a horizontal resistance band, entry on a clean
+      break above the band with volume expansion.
+    chart_timeframe: 1m
+    preconditions:                     # PLACEHOLDER
+      - volume_expansion_on_break
+    pattern_detection:
+      min_touches: 2                   # ASSUMPTION
+      max_resistance_band_percent: 0.5 # ASSUMPTION
+    entry_trigger: break_above_flat_top
+    invalid_entry_trigger: chase_above_band_by_more_than_n_cents
+    stop_rule: below_consolidation_low_or_failed_breakout_level
+    first_target: PLACEHOLDER
+    second_target: PLACEHOLDER
+    scale_out_logic: PLACEHOLDER
+    trailing_stop_logic: PLACEHOLDER
+    disqualification: PLACEHOLDER
+    min_reward_risk: 2.0               # ASSUMPTION
+
+  high_of_day_break:
+    enabled: true
+    description: |
+      Continuation through the high of day with volume expansion.
+    chart_timeframe: 1m
+    preconditions:
+      require_volume_expansion: true   # ASSUMPTION
+      max_chase_percent_above_breakout: 1.0  # ASSUMPTION
+    pattern_detection: PLACEHOLDER
+    entry_trigger: break_of_high_of_day
+    invalid_entry_trigger: chase_far_above_HOD
+    stop_rule: below_breakout_level_or_last_pullback_low
+    first_target: PLACEHOLDER
+    second_target: PLACEHOLDER
+    scale_out_logic: PLACEHOLDER
+    trailing_stop_logic: PLACEHOLDER
+    disqualification: PLACEHOLDER
+    min_reward_risk: 2.0               # ASSUMPTION
+
+  ABCD_continuation:
+    enabled: false                     # PLACEHOLDER - not yet specified
+    description: |
+      ABCD-style continuation pattern. Spec to be added once we have a
+      validated definition with source material.
+    chart_timeframe: 1m
+    preconditions: PLACEHOLDER
+    pattern_detection: PLACEHOLDER
+    entry_trigger: PLACEHOLDER
+    invalid_entry_trigger: PLACEHOLDER
+    stop_rule: PLACEHOLDER
+    first_target: PLACEHOLDER
+    second_target: PLACEHOLDER
+    scale_out_logic: PLACEHOLDER
+    trailing_stop_logic: PLACEHOLDER
+    disqualification: PLACEHOLDER
+    min_reward_risk: 2.0               # ASSUMPTION
+
+# ---------------------------------------------------------------------------
+# 4. Entry rules (cross-cutting, apply to every setup)
+# ---------------------------------------------------------------------------
+entry:
+  confirmation_requirements:            # ASSUMPTION
+    - candle_close_above_trigger
+  volume_requirements:                  # ASSUMPTION
+    min_volume_expansion_factor: 1.5
+  spread_requirements:
+    max_spread_percent: 1.5             # ASSUMPTION (mirrors universe filter)
+  bid_ask_behaviour:                    # PLACEHOLDER
+    require_lifted_offer: false
+  max_chase_distance_cents: 5           # ASSUMPTION
+  order_type:                           # ASSUMPTION
+    default: LMT
+    aggressive_regime: MKT
+  no_entry_conditions:                  # ASSUMPTION
+    - active_halt
+    - choppy_action
+    - spread_above_max
+    - no_clean_stop
+    - daily_loss_cap_reached
+    - max_trades_reached
+    - max_open_positions_reached
+
+# ---------------------------------------------------------------------------
+# 5. Stop rules
+# ---------------------------------------------------------------------------
+stops:
+  required_before_order_approval: true  # NON-NEGOTIABLE (hard requirement)
+  default_rule: below_pullback_low      # ASSUMPTION
+  allowed_rules:                        # ASSUMPTION
+    - below_pullback_low
+    - vwap_loss
+    - failed_breakout_level
+    - max_cents_per_share_risk
+  max_cents_per_share_risk: 20          # ASSUMPTION
+
+# ---------------------------------------------------------------------------
+# 6. Position sizing - deterministic risk-based
+# ---------------------------------------------------------------------------
+sizing:
+  formula: |
+    shares = floor(max_trade_risk_dollars / abs(entry_price - stop_price))
+  max_trade_risk_dollars: 50            # ASSUMPTION (overlap with risk.max_risk_per_trade_dollars)
+  caps:
+    max_position_value_dollars: 5000    # ASSUMPTION
+    max_shares_per_trade: null          # PLACEHOLDER
+    liquidity_cap_pct_of_avg_volume: 1  # ASSUMPTION (do not exceed 1% of avg vol)
+    buying_power_cap: true              # ASSUMPTION (always enforced)
+    market_regime_cap: true             # ASSUMPTION (regime multipliers from section 2)
+    daily_pnl_state_cap: true           # ASSUMPTION (scale down after losers)
+
+# ---------------------------------------------------------------------------
+# 7. Exit rules
+# ---------------------------------------------------------------------------
+exits:
+  partial_at_first_target: true         # ASSUMPTION
+  partial_at_first_target_pct: 50       # ASSUMPTION
+  partial_into_extension: true          # ASSUMPTION
+  stop_remainder_after_first_partial: breakeven_or_technical  # ASSUMPTION
+  exit_on_failed_breakout: true         # ASSUMPTION
+  exit_on_vwap_rejection: true          # ASSUMPTION
+  exit_on_halt_risk: true               # ASSUMPTION
+  exit_at_max_loss: true                # NON-NEGOTIABLE
+  time_based_exit_if_momentum_stalls:   # ASSUMPTION
+    enabled: true
+    stall_minutes: 3
+
+# ---------------------------------------------------------------------------
+# 8. Trade quality scoring (0-100)
+# ---------------------------------------------------------------------------
+scoring:
+  minimum_score_to_watch: 60                       # ASSUMPTION
+  minimum_score_to_prepare_trade: 75               # ASSUMPTION
+  minimum_score_to_request_manual_approval: 85     # ASSUMPTION
+
+  weights:                                          # ASSUMPTION - must sum to 100
+    relative_volume: 15
+    float: 10
+    gap_percent: 10
+    catalyst: 10
+    clean_pattern: 20
+    above_vwap: 10
+    liquidity: 10
+    tight_spread: 5
+    risk_reward: 10
+    time_of_day: 10
+    # Note: weights below intentionally NOT scored in v0 - tracked for future:
+    # market_regime, proximity_to_hod, choppiness_penalty
+    # When these are added, all weights must be re-normalised to sum to 100.
+
+# ---------------------------------------------------------------------------
+# 9. Proven setup metric
+#    A setup may only be promoted from manual-approval to autonomous once it
+#    meets ALL of these thresholds for its sample.
+# ---------------------------------------------------------------------------
+proven_setup_thresholds:
+  minimum_sample_size: 30                # ASSUMPTION
+  min_win_rate: 0.40                     # ASSUMPTION
+  min_profit_factor: 1.5                 # ASSUMPTION
+  min_expectancy_per_trade_dollars: 5    # ASSUMPTION (after slippage + comm.)
+  max_drawdown_pct_of_starting_capital: 10  # ASSUMPTION
+  slippage_adjusted_profit_required: true   # NON-NEGOTIABLE
+  evaluate_by:                           # required dimensions
+    - setup_type
+    - time_of_day_bucket
+    - market_regime
+    - float_range
+    - price_range
+    - scanner_alert_type
+
+# ---------------------------------------------------------------------------
+# 10. Decision states (engine output states - canonical list)
+# ---------------------------------------------------------------------------
+decision_states:
+  - IGNORE
+  - WATCH
+  - SETUP_FORMING
+  - READY_FOR_MANUAL_APPROVAL
+  - PAPER_ORDER_APPROVED
+  - PAPER_ORDER_SENT
+  - IN_TRADE
+  - EXIT_NOW
+  - BLOCKED_BY_RISK
+  - BLOCKED_BY_UNCERTAINTY
+
+# ---------------------------------------------------------------------------
+# 11. Audit requirements (must be present on every decision)
+# ---------------------------------------------------------------------------
+audit_required_fields:
+  - timestamp
+  - ticker
+  - scanner_source
+  - screenshot_reference
+  - parsed_scanner_fields
+  - chart_features
+  - detected_setup
+  - score
+  - entry
+  - stop
+  - target
+  - risk_dollars
+  - position_size
+  - decision_state
+  - reason_for_action
+  - reason_for_rejection
+  - config_version
+  - rule_version
+
+# ---------------------------------------------------------------------------
+# 12. Risk controls (NON-NEGOTIABLE - mirrors .env defaults)
+#    These values must equal or be stricter than the .env defaults. The
+#    engine refuses to start if any of these are missing.
+# ---------------------------------------------------------------------------
+risk:
+  paper_trading_only: true               # NON-NEGOTIABLE
+  live_trading_enabled: false            # NON-NEGOTIABLE default
+  manual_approval_required: true         # NON-NEGOTIABLE default
+  max_risk_per_trade_dollars: 50         # ASSUMPTION
+  max_daily_loss_dollars: 150            # ASSUMPTION
+  max_trades_per_day: 5                  # ASSUMPTION
+  max_open_positions: 1                  # ASSUMPTION
+  # Today max_open_positions=1 means "one logical position". When the
+  # multi-leg/starter feature lands (see section 14), this becomes
+  # "one logical position with N legs" - the cap still equals 1 logical
+  # position; total size across legs is bounded by max_position_value.
+  max_position_value_dollars: 5000       # ASSUMPTION
+  max_order_rate_per_minute: 3           # ASSUMPTION
+  stop_required: true                    # NON-NEGOTIABLE
+  reject_if_no_clean_stop: true          # NON-NEGOTIABLE
+  emergency_kill_switch: true            # NON-NEGOTIABLE
+  # ----- consecutive-losses cap -----
+  # Per Warrior Q "trader's set of rules" - the canonical 3 loss caps are
+  # max loss/day, max loss/trade, max consecutive losses. We enforce the
+  # first two as hard caps. Consecutive losses are TRACKED_ONLY for now -
+  # Jason 2026-06-14: "for paper trading I think we're going to take a
+  # while to get things right; let's incorporate enforcement later."
+  consecutive_losses:
+    mode: tracked_only                   # tracked_only | soft_pause | hard_pause
+    max_count_before_pause: 3            # ASSUMPTION (not enforced today)
+    pause_duration_minutes: 30           # ASSUMPTION (not enforced today)
+    notes: |
+      Engine should:
+        - Record consecutive_loss_count per run, reset on a winner.
+        - Surface the count on the /engine page and in the daily summary.
+        - NOT enforce a pause yet. Promote `mode` to soft_pause once we
+          have enough paper-trade samples to validate the threshold.
+
+# ---------------------------------------------------------------------------
+# 13. Psychological levels
+#     Source: principles.md::PSYCH_LEVEL_MAGNETS
+#             scenarios.yaml::bull_flag_starter_below_psych_level_with_green_ts
+#             scenarios.yaml::large_bid_at_psych_level_is_support
+#     Status: scaffold - engine does not yet compute these. Documents how
+#             the future feature should be configured.
+# ---------------------------------------------------------------------------
+psychological_levels:
+  enabled: false                         # ASSUMPTION - turn on when implemented
+  proximity_window_cents: 5              # ASSUMPTION - "close to" a psych level
+  level_kinds:                           # ASSUMPTION - all included by default
+    half_dollar: true                    # e.g. 5.50, 6.50
+    whole_dollar: true                   # e.g. 5.00, 6.00
+    quarter_dollar: false                # rarely material on small caps
+    premarket_high: true                 # already captured in DTD context
+    prior_day_high: true                 # NEW - need to capture in DTD context
+    prior_day_low: true                  # NEW - same
+    session_high_of_day: true            # already tracked by FirstPullbackLong
+  scoring:
+    # When an entry-bar close sits within proximity_window_cents of an
+    # active psych level, apply a small soft-score adjustment per the
+    # principle rules. Values are relative to the existing 0-100 score.
+    above_psych_level_bonus: 5           # ASSUMPTION
+    below_psych_level_penalty: 5         # ASSUMPTION
+    rejected_from_psych_level_penalty: 10  # ASSUMPTION
+  surface_to_user: true                  # show active psych levels in features panel
+
+# ---------------------------------------------------------------------------
+# 14. Entry legs - starter / scale-up / manage-out
+#     Source: principles.md::STARTER_THEN_SCALE_UP_THEN_MANAGE_OUT
+#             scenarios.yaml::layered_entries_during_sustained_uptrend
+#             Jason direct guidance 2026-06-14.
+#     Status: scaffold - engine is single-leg today. Captures the SHAPE the
+#             extended engine will need.
+# ---------------------------------------------------------------------------
+entry_legs:
+  enabled: false                         # ASSUMPTION - feature gated on engine extension
+  max_legs_per_position: 4               # ASSUMPTION - "Ross often takes a starter and scales up quickly"
+  leg_sizing:
+    starter_fraction: 0.25               # ASSUMPTION - first leg = 25% of full size
+    scale_up_legs_share_fraction_evenly: true  # ASSUMPTION
+  re_entry_conditions:
+    fresh_gate_eval_required: true       # NON-NEGOTIABLE - every leg passes full gate stack
+    min_seconds_between_legs: 10         # ASSUMPTION
+    max_legs_per_minute: 3               # ASSUMPTION - matches risk.max_order_rate_per_minute
+  exit_modes:                            # ASSUMPTION - both modes must be supported
+    full_exit_triggers:
+      - hard_stop
+      - macd_flip
+      - vwap_loss
+      - l2_distress
+      - tape_flip
+      - halt_risk
+      - time_stop
+      - emergency_kill_switch
+    scale_out_triggers:
+      - first_target
+      - second_target
+      - manual_partial
+    scale_out_order: fifo                # ASSUMPTION - close oldest leg first
+  total_size_cap: governed_by_risk_section  # legs share the same caps
+  notes: |
+    Engine extension TODO list (no code yet):
+      1. Promote PendingApproval -> PendingPosition with N legs.
+      2. ExitTriggerSet must distinguish per-leg vs position-level exits.
+      3. Risk gate counts total_size = sum(leg.size); approves new legs
+         only if total <= max_position_value.
+      4. Slippage tracking: per-leg signal_price vs fill_price.
+      5. UI: stack of leg cards under the Active Run panel.
+
+# ---------------------------------------------------------------------------
+# 15. L2 guidelines (soft / advisory)
+#     Source: principles.md::P3
+#             scenarios.yaml::large_bid_at_psych_level_is_support
+#                            ::large_ask_might_be_iceberg
+#                            ::next_visible_bid_is_next_support
+#     Status: scaffold - soft-score inputs and stop-placement hints.
+#             NOT hard rules per Jason 2026-06-14.
+# ---------------------------------------------------------------------------
+l2_guidelines:
+  enabled_when: depth_subscription_active
+  big_size_multiplier_of_median: 5       # ASSUMPTION - "big" = >= 5x median top-N size
+  big_bid_support:
+    proximity_to_entry_cents: 10         # ASSUMPTION
+    score_bonus: 5                       # ASSUMPTION
+  big_ask_caution:
+    proximity_to_entry_cents: 10         # ASSUMPTION
+    score_penalty: 5                     # ASSUMPTION
+    note: |
+      Visible big ask might be a real wall, an iceberg fragment, or a
+      spoof. Apply a soft penalty proportional to size; never hard-block.
+  next_visible_bid_stop:
+    enabled: false                       # ASSUMPTION - off until implemented
+    prefer_visible_bid_when_within_cents: 5  # ASSUMPTION
+    note: |
+      When stop_mode='pullback_low' and L2 is available, prefer placing
+      the stop just below the nearest meaningful visible bid IF it sits
+      within prefer_visible_bid_when_within_cents of the chart-derived
+      stop. Otherwise use the chart-derived stop.
+
+# ---------------------------------------------------------------------------
+# 16. T&S guidelines (soft / advisory)
+#     Source: principles.md::P4
+#             scenarios.yaml::big_green_burst_is_strength
+#     Status: scaffold - extends the existing tape_buy_pct_60s feature.
+# ---------------------------------------------------------------------------
+ts_guidelines:
+  enabled_when: tape_subscription_active
+  big_green_burst:
+    enabled: false                       # ASSUMPTION - feature not yet computed
+    window_seconds: 30                   # ASSUMPTION
+    min_large_prints: 3                  # ASSUMPTION
+    large_print_size_multiplier_of_median: 5  # ASSUMPTION
+    score_bonus: 5                       # ASSUMPTION
+  dont_distinguish_intent: true          # PRINCIPLE - do NOT build features
+                                         # that try to tell short-cover from
+                                         # new-long. Buying is buying.
+  green_volume_below_psych_level:
+    enabled: false                       # ASSUMPTION - composes with psychological_levels
+    proximity_to_psych_level_cents: 5    # ASSUMPTION
+    score_bonus: 5                       # ASSUMPTION
+
+# ---------------------------------------------------------------------------
+# 17. Parked - intentionally deferred items
+#     Recorded so they aren't lost. Engine does NOT consume this section.
+# ---------------------------------------------------------------------------
+parked:
+  five_minute_setups:
+    reason: |
+      Jason 2026-06-14: Ross trades almost exclusively on the 1m chart.
+      Defer 5m setups (5m bull flag, first 5m candle to make new high)
+      until v1.1 1m workflow is validated.
+    sources:
+      - scenarios.yaml::first_5m_candle_new_high
+      - scenarios.yaml::layered_entries_during_sustained_uptrend
+  hold_above_5m_9_ema:
+    reason: |
+      Same as above - 5m filter deferred until we add longer-hold
+      runner management on top of the 1m entry workflow.
+    sources:
+      - principles.md::PARKED__HOLD_ABOVE_9_EMA_5M
+      - scenarios.yaml::hold_above_5m_9_ema_PARKED
