@@ -6,6 +6,7 @@ RULE_SET_CHANGED = "rules.changed"     # user edited rule set
 
 # Engine (POC trading engine)
 ENGINE_BAR = "engine.bar"                          # each closed 1m bar
+ENGINE_BAR_TICK = "engine.bar_tick"                # in-progress bar update (every 5s); NOT journaled
 ENGINE_INDICATOR = "engine.indicator"              # each MACD update
 ENGINE_SIGNAL = "engine.signal"                    # each signal emitted
 ENGINE_APPROVAL_NEEDED = "engine.approval_needed"  # non-autonomous run awaiting approval

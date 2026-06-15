@@ -223,6 +223,23 @@ export function EngineChart({
         continue;
       }
 
+      if (type === "bar_tick") {
+        // In-progress bar update (~every 5s). Update the rightmost candle
+        // without marking it "seen", so subsequent ticks keep refining it.
+        // Once the official `bar` event arrives at minute close, that ts is
+        // added to seenBarsRef and further ticks for the same ts are no-ops.
+        const ts = String(inner.ts ?? "");
+        if (!ts || seenBarsRef.current.has(ts)) continue;
+        candleRef.current.update({
+          time: tsToTime(ts),
+          open: Number(inner.open),
+          high: Number(inner.high),
+          low: Number(inner.low),
+          close: Number(inner.close),
+        });
+        continue;
+      }
+
       if (type === "indicator") {
         const barTs = String(inner.bar_ts ?? "");
         const strat = (inner.strategy ?? {}) as Record<string, unknown>;

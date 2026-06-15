@@ -9,16 +9,19 @@ strategy on small-cap US equities, with forex as a 24-hour smoke-test rail.
 > `PAPER_TRADING_ONLY=true`); the system refuses to submit orders outside
 > paper.
 
-## Current state — June 14, 2026
+## Current state — June 15, 2026
 
 **v1.2 semi-automated FirstPullback engine** is the active surface. Visit
 `/engine`. You arm a single symbol (the human picks it — currently no
 auto-promotion from DTD), the engine watches the gate stack, and submits
 paper orders via IBKR TWS.
 
-Verified end-to-end **today** against `VSME` on paper account
-`DUM733674`: contract qualified through SMART → NASDAQ, engine started,
-`engine_start` + `ibkr_connected` events written, clean stop.
+Verified end-to-end against `VSME` on paper account `DUM733674`: contract
+qualified through SMART → NASDAQ, engine started, `engine_start` +
+`ibkr_connected` events written, clean stop. EUR.USD on IDEALPRO is the
+current overnight smoke rail and streams bars cleanly under the new
+historical-bar bootstrap (MACD/VWAP warm up immediately, no 30-minute
+wait).
 
 The earlier DTD scanner/funnel work (`/candidates`, `/rules`, `/rejected`,
 `scripts/dtd_*.py`) is **still in the repo but on hold** since the pivot
@@ -37,7 +40,27 @@ engine yet.
 3. **Sell-anchor A/B (Phase 3, optional)** — re-run the same setup
    with `sell_anchor=ask` to compare aggressive vs passive sell fills.
 
-### Recent fix worth knowing about
+### Recently landed
+
+- **Historical-bar bootstrap** (`183f5da`): on every Arm, the engine
+  pulls 4 hours of 1m bars from IBKR and replays them through the
+  strategy + the 5m aggregator so 1m MACD, 5m MACD, VWAP and the
+  pullback history are warm immediately. No more 30-minute warm-up
+  before the gate stack is meaningful. Replayed signals are discarded;
+  a single `bootstrap` audit event records what was preloaded.
+- **Live forming candle** (in flight): the `BarFeed` now publishes
+  `engine.bar_tick` updates every 5 seconds with the in-progress 1m
+  bar's running OHLC; the chart updates the rightmost candle in real
+  time. Strategy decisions remain strictly bar-close driven (no change
+  to entry/exit behaviour). Visual-only — not journaled.
+- **Orphan engine_run sweep on backend startup**: any `engine_runs`
+  rows left in `starting` / `running` / `stopping` (e.g. because
+  uvicorn `--reload` killed the previous process before `stop()` could
+  journal) are swept to `stopped` with `stop_reason =
+  'backend_restart_orphaned'` on the next backend boot. Keeps Recent
+  Runs honest.
+
+### Earlier fix worth knowing about
 
 `backend/src/day_trade/db/session.py` was missing
 `@asynccontextmanager`, which meant **every DB-writing endpoint —

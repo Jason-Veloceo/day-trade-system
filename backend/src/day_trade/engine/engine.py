@@ -33,9 +33,10 @@ from ib_async import Contract, Ticker
 from day_trade.config import Settings, get_settings
 from day_trade.db.models import BarAggregate, EngineRun
 from day_trade.db.session import session_scope
+from day_trade.ws import topics as T
 from day_trade.ws.broker import MessageBroker
 
-from .bars import BarFeed
+from .bars import BarFeed, PartialBar
 from .exits import ExitConfig, ExitDecision, ExitEvaluationInputs, ExitTriggerSet
 from .executor import Executor
 from .features import FeatureSnapshot, compute_snapshot
@@ -258,6 +259,7 @@ class TradingEngine:
             contract,
             self.spec.what_to_show,
             self._on_bar,
+            on_partial_bar=self._on_partial_bar,
         )
         self.feed.start()
 
@@ -460,6 +462,38 @@ class TradingEngine:
             await self.journal.record(
                 "error", {"where": "_on_bar", "msg": f"unsupported signal kind {signal.kind}"}
             )
+
+    async def _on_partial_bar(self, snapshot: PartialBar) -> None:
+        """Publish the in-progress 1m bar's running OHLC for live UI updates.
+
+        Fires every ~5 seconds (each time a 5s real-time bar arrives). This
+        path is deliberately lightweight: it does NOT touch the DB, NOT call
+        the strategy, NOT update indicators, and NOT trigger any decisions.
+        It exists purely so the engine page can render a live forming candle
+        instead of waiting a full minute between updates. Strategy behaviour
+        remains strictly bar-close driven (see Ross-style spec).
+        """
+        if self._stop_event.is_set() or self.run_id is None:
+            return
+        try:
+            await self.broker.publish(
+                T.ENGINE_BAR_TICK,
+                {
+                    "run_id": self.run_id,
+                    "event_type": "bar_tick",
+                    "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "payload": {
+                        "ts": snapshot.ts.isoformat(),
+                        "open": snapshot.open,
+                        "high": snapshot.high,
+                        "low": snapshot.low,
+                        "close": snapshot.close,
+                        "volume": snapshot.volume,
+                    },
+                },
+            )
+        except Exception:
+            logger.exception("failed to publish bar_tick")
 
     async def _on_5m_bar(self, bar: Bar) -> None:
         if self._stop_event.is_set() or self.strategy is None or self.journal is None:

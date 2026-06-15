@@ -6,6 +6,12 @@ strategy consumes from that queue.
 
 Why not just request 1-minute bars from IBKR? Because reqRealTimeBars only
 supports 5-second size. Anything larger has to be aggregated client-side.
+
+The feed can also publish "partial bar" updates every 5 seconds via the
+optional `on_partial_bar` callback. These describe the *currently-forming*
+minute bar's running OHLC and are intended for live UI updates only — they
+are explicitly NOT used to drive strategy decisions (which remain bar-close
+driven) and are NOT journaled to the database.
 """
 
 from __future__ import annotations
@@ -13,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from ib_async import Contract, RealTimeBar, RealTimeBarList
@@ -21,6 +28,23 @@ from .ibkr_client import IBKRClient
 from .strategies.base import Bar
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PartialBar:
+    """Snapshot of the in-progress 1-minute bar at a 5-second tick.
+
+    `ts` is the *close* time of the bar being formed (same value that the
+    eventual closed Bar will carry). Consumers can use it as a stable key
+    when updating a live chart's rightmost candle.
+    """
+
+    ts: dt.datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
 
 
 def _bar_minute_close(rt_time: dt.datetime) -> dt.datetime:
@@ -49,11 +73,13 @@ class BarFeed:
         contract: Contract,
         what_to_show: str,
         on_minute_close: Callable[[Bar], Awaitable[None]],
+        on_partial_bar: Callable[[PartialBar], Awaitable[None]] | None = None,
     ) -> None:
         self._ibkr = ibkr
         self._contract = contract
         self._what_to_show = what_to_show
         self._on_minute_close = on_minute_close
+        self._on_partial_bar = on_partial_bar
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._rt_handle: RealTimeBarList | None = None
@@ -98,12 +124,14 @@ class BarFeed:
         # First bar ever -> initialise the current minute.
         if self._cur_close is None:
             self._reset_minute(bar_close, b)
+            self._emit_partial()
             return
 
         # If this 5s bar belongs to a NEW minute, emit the previous one.
         if bar_close != self._cur_close:
             self._emit_current()
             self._reset_minute(bar_close, b)
+            self._emit_partial()
             return
 
         # Same minute -> merge.
@@ -111,6 +139,7 @@ class BarFeed:
         self._cur_low = min(self._cur_low, float(b.low))
         self._cur_last = float(b.close)
         self._cur_volume += float(b.volume) if b.volume is not None else 0.0
+        self._emit_partial()
 
     def _reset_minute(self, close: dt.datetime, b: RealTimeBar) -> None:
         self._cur_close = close
@@ -148,3 +177,38 @@ class BarFeed:
             await self._on_minute_close(bar)
         except Exception:
             logger.exception("BarFeed callback raised")
+
+    def _emit_partial(self) -> None:
+        """Schedule the partial-bar callback if one is registered.
+
+        Called from inside `_ingest` after the running OHLC has been updated.
+        Cheap to call: if no callback was provided this is a single attribute
+        check and a return.
+        """
+        cb = self._on_partial_bar
+        if cb is None:
+            return
+        if self._cur_close is None or self._cur_open is None:
+            return
+        snapshot = PartialBar(
+            ts=self._cur_close,
+            open=self._cur_open,
+            high=self._cur_high,
+            low=self._cur_low,
+            close=self._cur_last,
+            volume=self._cur_volume,
+        )
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        task = loop.create_task(self._safe_partial(snapshot))
+        task.add_done_callback(lambda _t: None)
+
+    async def _safe_partial(self, snapshot: PartialBar) -> None:
+        cb = self._on_partial_bar
+        if cb is None:
+            return
+        try:
+            await cb(snapshot)
+        except Exception:
+            logger.exception("BarFeed partial callback raised")

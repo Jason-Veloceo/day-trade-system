@@ -4,10 +4,21 @@ When you sit down Monday and the markets are awake again, this is the
 shortest path from "everything is built" to "I've seen the engine make a
 paper trade end-to-end".
 
-**Where you are right now (Sun 14 Jun 2026, Perth):**
+**Where you are right now (Mon 15 Jun 2026, Perth):**
 - v1.1 engine: built, all 68 backend tests pass.
-- v1.2 sell anchor + pullback-break trigger: built, migration applied
-  (head = `4e1f0a82c9b1`).
+- v1.2 sell anchor + pullback-break trigger: built.
+- Historical-bar **bootstrap** landed: MACD/VWAP/pullback history warm
+  up immediately on Arm using 4h of 1m bars from IBKR — no 30-minute
+  blind period before gates are meaningful. Migration head now
+  `7b3a0c5d28f1` (adds the `bootstrap` engine_event type).
+- **Live forming candle** in chart (UI-only, in flight): the
+  `BarFeed` publishes `engine.bar_tick` updates every 5s and the
+  rightmost candle on the engine chart should grow in real time.
+  Visual only — strategy decisions remain strictly bar-close driven.
+- **Orphan engine_run sweep**: any rows left in non-terminal status by
+  an ungraceful backend exit (uvicorn `--reload`, crash, SIGKILL) are
+  swept to `stopped, reason=backend_restart_orphaned` on the next
+  backend startup. Recent Runs is now honest after a restart.
 - Knowledge base (`strategy_sources/principles.md`, `scenarios.yaml`):
   ingested but documentation-only — engine does NOT consume it yet.
 
@@ -36,7 +47,8 @@ paper trade end-to-end".
    ```bash
    cd backend && uv run alembic current
    ```
-   Expect: `4e1f0a82c9b1 (head)` — that's the `sell_anchor` column.
+   Expect: `7b3a0c5d28f1 (head)` — that's the `bootstrap` engine_event
+   type. Predecessor `4e1f0a82c9b1` added the `sell_anchor` column.
 
 ## Phase 1 — forex smoke (Monday early morning Perth)
 
@@ -75,24 +87,31 @@ expected — they degrade gracefully).
    - **Mode**: `Manual approval` (you'll Approve / Reject each entry)
 4. Click **Arm engine**.
 5. Watch the **Strategy state** panel:
-   - 1m MACD populates within ~1–2 minutes
-   - 5m MACD takes longer (~30+ min — the engine does NOT bootstrap
-     historical 5m bars; it builds them live)
-   - VWAP shows `na` (forex midpoint bars have no volume)
+   - 1m MACD and 5m MACD are **already warm** the moment you arm
+     (bootstrap replays 4h of 1m bars and primes the 5m aggregator).
+     Look for a `bootstrap` event in the Live event log with non-null
+     `macd_1m_hist_after` and `macd_5m_hist_after`.
+   - VWAP shows `na` on forex (midpoint bars have no volume) but is
+     warm on equities.
    - "Last entry gate" shows the reason each bar is being rejected
-     (most commonly "5m MACD not warmed up yet" early on)
-   - "Last trigger" tile shows whether the trigger fired and why not
-6. Watch the **Live event log**:
+     (usually a real gate failure now, not "not warmed up").
+   - "Last trigger" tile shows whether the trigger fired and why not.
+6. Watch the **chart**:
+   - 1m candles render once per minute close (final OHLC).
+   - The rightmost candle should also update every ~5 seconds as the
+     current minute forms (live forming candle). If it doesn't and
+     you've hard-refreshed, that's a known follow-up.
+7. Watch the **Live event log**:
    - `bar` events every minute
    - `indicator` events every minute (and `tf=5m` every 5 minutes)
    - When all gates pass: `decision` + an approval banner
-7. **Approve** to send a paper LMT order. Watch:
+8. **Approve** to send a paper LMT order. Watch:
    - `order_submit` → `order_status` → `fill` → `slippage` events
    - The exit-trigger framework starts watching as soon as the entry fills
-8. If an exit trigger fires (e.g. MACD flip), it submits a SELL and
+9. If an exit trigger fires (e.g. MACD flip), it submits a SELL and
    journals an `exit_trigger` decision. The strategy **auto re-arms**
    for the next entry.
-9. Click **Stop engine** when you're done.
+10. Click **Stop engine** when you're done.
 
 **Success criteria for Phase 1:**
 - engine started without IBKR error
@@ -185,8 +204,6 @@ anchor you prefer per situation.
 
 These are documented and intentional:
 
-- **5m MACD slow to warm**: no historical bootstrap; ~30 min of live
-  data before the 5m trend gate is meaningful.
 - **No real P&L attribution into risk gate**: realized P&L is journaled
   on every fill but the daily-loss counter uses trade count + per-trade
   caps, not realised loss. Hard cap (max_daily_loss) is enforced on

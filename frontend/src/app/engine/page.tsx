@@ -16,6 +16,7 @@ import { EngineChart } from "@/components/EngineChart";
 
 const ENGINE_TOPICS = new Set([
   "engine.bar",
+  "engine.bar_tick",
   "engine.indicator",
   "engine.signal",
   "engine.approval_needed",
@@ -104,7 +105,9 @@ export default function EnginePage() {
     revalidateOnFocus: false,
     refreshInterval: 5000,
   });
-  const { messages, connected } = useBrokerStream({ bufferSize: 600 });
+  // Buffer sized to comfortably hold ~100 minutes of activity even with
+  // 12 bar_tick events / minute streaming into the chart.
+  const { messages, connected } = useBrokerStream({ bufferSize: 1500 });
 
   const [form, setForm] = useState<EngineStartIn>(DEFAULT_START);
   const [busy, setBusy] = useState(false);
@@ -1086,8 +1089,11 @@ type FilterKey = (typeof FILTERS)[number];
 function EventLog({ events }: { events: WsMessage[] }) {
   const [filter, setFilter] = useState<FilterKey>("all");
   const filtered = useMemo(() => {
-    if (filter === "all") return events;
-    return events.filter((m) => (m.payload?.event_type ?? "") === filter);
+    // bar_tick events flow only to the chart (they're high-volume,
+    // not journaled, and have no audit value). Hide them from the log.
+    const base = events.filter((m) => (m.payload?.event_type ?? "") !== "bar_tick");
+    if (filter === "all") return base;
+    return base.filter((m) => (m.payload?.event_type ?? "") === filter);
   }, [events, filter]);
 
   const reversed = [...filtered].reverse();
