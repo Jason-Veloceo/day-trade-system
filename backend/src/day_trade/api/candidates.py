@@ -19,17 +19,16 @@ async def list_candidates(
     trading_day: dt.date | None = Query(default=None, description="YYYY-MM-DD"),
     limit: int = Query(default=200, le=1000),
 ) -> list[CandidateOut]:
-    async for session in session_scope():
+    async with session_scope() as session:
         rows = await repo.list_candidates(
             session, trading_day=trading_day, status=status, limit=limit
         )
         return [CandidateOut.model_validate(r) for r in rows]
-    raise RuntimeError("session_scope yielded nothing")
 
 
 @router.get("/{candidate_id}", response_model=CandidateDetailOut)
 async def get_candidate(candidate_id: int) -> CandidateDetailOut:
-    async for session in session_scope():
+    async with session_scope() as session:
         row = await repo.get_candidate(session, candidate_id)
         if row is None:
             raise HTTPException(404, "candidate not found")
@@ -50,4 +49,3 @@ async def get_candidate(candidate_id: int) -> CandidateDetailOut:
             news_storyurl=news_storyurl,
             news_datetime=news_datetime,
         )
-    raise RuntimeError("session_scope yielded nothing")

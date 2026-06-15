@@ -16,7 +16,7 @@ router = APIRouter(prefix="/rules", tags=["rules"])
 
 @router.get("/active", response_model=RuleSetOut)
 async def get_active() -> RuleSetOut:
-    async for session in session_scope():
+    async with session_scope() as session:
         rule_set, _ = await repo.get_active_rule_set(session)
         if rule_set is None:
             raise HTTPException(404, "no active rule set")
@@ -28,7 +28,6 @@ async def get_active() -> RuleSetOut:
             note=rule_set.note,
             rules=[RuleOut.model_validate(r) for r in rule_set.rules],
         )
-    raise RuntimeError("session_scope yielded nothing")
 
 
 @router.put("/active", response_model=RuleSetOut, status_code=201)
@@ -49,7 +48,7 @@ async def replace_active(payload: RuleSetUpdateIn) -> RuleSetOut:
         )
         for r in payload.rules
     ]
-    async for session in session_scope():
+    async with session_scope() as session:
         rule_set = await repo.create_rule_set(
             session, name=payload.name, rules=specs, make_active=True, note=payload.note
         )

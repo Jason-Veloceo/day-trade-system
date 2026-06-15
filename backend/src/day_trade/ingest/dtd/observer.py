@@ -148,7 +148,7 @@ async def default_event_sink(event: RawDtdEvent) -> None:
     from day_trade.ws.broker import get_broker
     from day_trade.ws.topics import CANDIDATE_UPDATE, SCANNER_EVENT
 
-    async for session in session_scope():
+    async with session_scope() as session:
         result = await ingest_event(session, event)
         broker = get_broker()
         await broker.publish(

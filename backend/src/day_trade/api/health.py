@@ -17,7 +17,6 @@ async def healthz() -> dict[str, str]:
 
 @router.get("/readyz")
 async def readyz() -> dict[str, str]:
-    async for session in session_scope():
+    async with session_scope() as session:
         await session.execute(text("SELECT 1"))
         return {"status": "ready", "db": "ok"}
-    raise RuntimeError("session_scope yielded nothing")

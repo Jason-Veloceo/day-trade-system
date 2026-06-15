@@ -33,7 +33,7 @@ def load_events(path: Path) -> list[RawDtdEvent]:
 
 
 async def _process_one(event: RawDtdEvent) -> None:
-    async for session in session_scope():
+    async with session_scope() as session:
         result = await ingest_event(session, event)
         broker = get_broker()
         await broker.publish(
