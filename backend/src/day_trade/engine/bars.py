@@ -114,7 +114,7 @@ class BarFeed:
 
     def _reset_minute(self, close: dt.datetime, b: RealTimeBar) -> None:
         self._cur_close = close
-        self._cur_open = float(b.open)
+        self._cur_open = float(b.open_)
         self._cur_high = float(b.high)
         self._cur_low = float(b.low)
         self._cur_last = float(b.close)
