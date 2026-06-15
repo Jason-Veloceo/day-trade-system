@@ -60,6 +60,36 @@ engine yet.
   'backend_restart_orphaned'` on the next backend boot. Keeps Recent
   Runs honest.
 
+### Open follow-ups (pick up here)
+
+Last session ended Mon 15 Jun ~23:10 Perth with everything pushed and
+the engine stopped manually. Pickup priorities for the next session:
+
+1. **Live forming candle not visibly updating in the browser** despite
+   the backend code being in place (commit `9083618`). When the chart
+   rendered EUR.USD overnight-test it still only redrew on minute
+   close. Diagnose path:
+   - Open `/engine` with DevTools → Network → WS frames. Filter for
+     `engine.bar_tick`. Confirm the messages are arriving from the
+     backend at ~5s cadence with `payload.event_type === "bar_tick"`.
+   - If they ARE arriving: the bug is in `frontend/src/components/EngineChart.tsx`
+     (the new `if (type === "bar_tick")` branch in effect #3) or in
+     `frontend/src/app/engine/page.tsx` (the `ENGINE_TOPICS` filter,
+     which we did add `engine.bar_tick` to). Likely Next.js HMR didn't
+     pick up the new effect — try a full restart of `npm run dev`.
+   - If they are NOT arriving: the bug is backend-side. Check that
+     `BarFeed._on_partial_bar` is being scheduled in `_ingest` (it
+     fires unconditionally now), and that `TradingEngine._on_partial_bar`
+     is actually publishing. Add a temporary `logger.debug("bar_tick %s", snapshot.ts)`
+     to confirm.
+2. **Verify the orphan sweep ran**: on backend startup, grep the log
+   for `swept N orphaned engine_run row(s)`. There should be 0 next
+   time (we cleaned them all manually + via the new sweep landed in
+   `9083618`).
+3. **Optional**: add a `test_bars.py` unit test covering both the
+   minute-aggregation behaviour and the new `on_partial_bar` callback.
+   We do not currently exercise `BarFeed` in tests.
+
 ### Earlier fix worth knowing about
 
 `backend/src/day_trade/db/session.py` was missing
