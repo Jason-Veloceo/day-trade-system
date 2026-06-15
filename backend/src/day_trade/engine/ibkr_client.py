@@ -186,6 +186,32 @@ class IBKRClient:
         except Exception:
             logger.exception("error cancelling real-time bars")
 
+    async def fetch_historical_1m_bars(
+        self,
+        contract: Contract,
+        what_to_show: str,
+        duration_seconds: int,
+        use_rth: bool = False,
+    ) -> list:
+        """Pull recent historical 1-minute bars for indicator warm-up at
+        engine start. Returns ib_async BarData objects (which expose `.date`,
+        `.open`, `.high`, `.low`, `.close`, `.volume`). Caller is responsible
+        for converting to the engine's internal Bar type.
+
+        `duration_seconds` is the lookback window. 90 minutes (5400s) is the
+        practical minimum for 1m MACD(12, 26, 9) to fully warm up; 4 hours
+        (14400s) covers 5m MACD warm-up too (~30 5m bars).
+        """
+        return await self._ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime="",
+            durationStr=f"{int(duration_seconds)} S",
+            barSizeSetting="1 min",
+            whatToShow=what_to_show,
+            useRTH=use_rth,
+            formatDate=1,
+        )
+
     # --- L2 / T&S ---
     #
     # We expose `subscribe_depth` and `subscribe_tape` that take the per-symbol

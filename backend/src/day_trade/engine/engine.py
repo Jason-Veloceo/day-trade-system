@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from ib_async import Ticker
+from ib_async import Contract, Ticker
 
 from day_trade.config import Settings, get_settings
 from day_trade.db.models import BarAggregate, EngineRun
@@ -237,6 +237,22 @@ class TradingEngine:
 
         await self._set_run_status("running")
 
+        # Warm up indicators (1m MACD, 5m MACD, VWAP if applicable, pullback
+        # history) with recent historical bars from IBKR. Without this the
+        # engine would need ~26 minutes of live 1m bars before 1m MACD becomes
+        # available, and ~130 minutes before 5m MACD does. With this, every
+        # arm is immediately useful.
+        try:
+            await self._bootstrap_indicators(contract)
+        except Exception as e:
+            # Bootstrap failure is non-fatal: the engine falls back to live
+            # warm-up. We journal the error so it shows up in the audit log.
+            logger.exception("indicator bootstrap failed; falling back to live warm-up")
+            await self.journal.record(
+                "error",
+                {"where": "bootstrap_indicators", "error": f"{type(e).__name__}: {e}"},
+            )
+
         self.feed = BarFeed(
             self.ibkr,
             contract,
@@ -246,6 +262,97 @@ class TradingEngine:
         self.feed.start()
 
         return run_id
+
+    async def _bootstrap_indicators(self, contract: Contract) -> None:
+        """Pull recent 1m historical bars and replay them into the strategy
+        and 5m aggregator so MACD / VWAP / pullback history are ready to
+        trade immediately on the first live bar.
+
+        Signals emitted by the strategy during replay are discarded - they
+        are based on stale data and must not be executed. The journal records
+        a single `bootstrap` event summarising what was preloaded; no
+        per-bar `bar` / `indicator` events are written (those are for live
+        bars only).
+        """
+        assert self.strategy is not None
+        assert self.tf5 is not None
+        assert self.journal is not None
+
+        # 4 hours (14400s) is enough to fully warm 5m MACD(12/26/9) - 26x5 = 130
+        # bars - while still being well inside IBKR's reqHistoricalData limits
+        # for 1-minute bars on any instrument we care about (forex / US equity).
+        duration_seconds = 4 * 60 * 60
+
+        raw_bars = await self.ibkr.fetch_historical_1m_bars(
+            contract,
+            self.spec.what_to_show,
+            duration_seconds=duration_seconds,
+            use_rth=False,
+        )
+        if not raw_bars:
+            await self.journal.record(
+                "bootstrap",
+                {"bars_1m": 0, "note": "no historical bars returned by IBKR"},
+            )
+            return
+
+        # Convert ib_async BarData -> our Bar. BarData.date is a date or
+        # datetime depending on barSizeSetting; for "1 min" it's a tz-aware
+        # datetime that represents the bar START. Engine convention is bar
+        # CLOSE, so we add one minute.
+        bars_1m: list[Bar] = []
+        for bd in raw_bars:
+            ts = bd.date
+            if not isinstance(ts, dt.datetime):
+                # Defensive: skip date-only entries (would only happen for
+                # daily/weekly bars, which we don't request).
+                continue
+            close_ts = ts + dt.timedelta(minutes=1)
+            bars_1m.append(
+                Bar(
+                    ts=close_ts,
+                    open=float(bd.open),
+                    high=float(bd.high),
+                    low=float(bd.low),
+                    close=float(bd.close),
+                    volume=float(bd.volume) if bd.volume is not None else 0.0,
+                )
+            )
+
+        # Replay 1m bars into the strategy. Discard any emitted signals -
+        # they are based on stale data and must not be acted upon.
+        for bar in bars_1m:
+            _ = self.strategy.on_bar(bar)
+
+        # Prime the 5m aggregator with the same 1m bars. It returns the list
+        # of 5m bars that closed during the backfill; we feed those into
+        # strategy.on_5m_bar to warm up the 5m MACD.
+        emitted_5m = self.tf5.prime_with_history(bars_1m)
+        for bar5m in emitted_5m:
+            self.strategy.on_5m_bar(bar5m)
+
+        first_ts = bars_1m[0].ts.isoformat() if bars_1m else None
+        last_ts = bars_1m[-1].ts.isoformat() if bars_1m else None
+        snap = self.strategy.snapshot()
+        await self.journal.record(
+            "bootstrap",
+            {
+                "bars_1m": len(bars_1m),
+                "bars_5m_emitted": len(emitted_5m),
+                "first_bar_close_utc": first_ts,
+                "last_bar_close_utc": last_ts,
+                "macd_1m_hist_after": snap.get("macd_1m_hist"),
+                "macd_5m_hist_after": snap.get("macd_5m_hist"),
+                "vwap_after": snap.get("vwap"),
+                "vwap_state_after": snap.get("vwap_state"),
+            },
+        )
+        logger.info(
+            "bootstrap complete: replayed %d 1m bars, %d 5m bars; "
+            "macd_1m_hist=%s macd_5m_hist=%s",
+            len(bars_1m), len(emitted_5m),
+            snap.get("macd_1m_hist"), snap.get("macd_5m_hist"),
+        )
 
     async def stop(self, reason: str = "user_stop") -> None:
         if self._stop_event.is_set():

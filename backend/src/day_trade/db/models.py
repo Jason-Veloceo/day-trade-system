@@ -100,6 +100,7 @@ engine_event_type_enum = Enum(
     "tape_print",
     "exit_trigger",
     "feature_snapshot",
+    "bootstrap",
     name="engine_event_type",
     create_type=True,
 )
