@@ -18,6 +18,11 @@ One-time TWS configuration (already done per screenshot):
 
 Run:
     cd backend && uv run python ../scripts/ibkr_check.py
+    cd backend && uv run python ../scripts/ibkr_check.py UPC SOFI   # probe extra symbols
+    cd backend && uv run python ../scripts/ibkr_check.py UPC --only # ONLY probe given symbols
+
+Extra symbols are treated as US equities on SMART routing with USD currency.
+For forex use "XXX.YYY" (e.g. EUR.USD) and we'll route to IDEALPRO.
 """
 
 from __future__ import annotations
@@ -121,11 +126,36 @@ async def main() -> None:
         ib.reqMarketDataType(s.ibkr_market_data_type_code)
         results: dict[str, dict] = {}
 
-        # Each probe: name, contract, what_to_show.
-        probes = [
+        # CLI args: positional symbols to probe in addition to (or instead of)
+        # the defaults. --only restricts to user-supplied symbols.
+        argv = [a for a in sys.argv[1:] if a]
+        only = "--only" in argv
+        user_symbols = [a for a in argv if not a.startswith("-")]
+
+        defaults = [
             ("SPY (US equity ETF, AMEX-listed)", Stock("SPY", "SMART", "USD"), "TRADES"),
             ("EUR.USD (forex, IDEALPRO, ~24h Sun-Fri)", Forex("EURUSD"), "MIDPOINT"),
         ]
+        probes = [] if only else list(defaults)
+        for sym in user_symbols:
+            s_norm = sym.strip().upper()
+            if "." in s_norm:
+                parts = s_norm.split(".")
+                if len(parts) == 2 and all(len(p) == 3 for p in parts):
+                    probes.append((
+                        f"{s_norm} (forex, IDEALPRO)",
+                        Forex(parts[0] + parts[1]),
+                        "MIDPOINT",
+                    ))
+                else:
+                    print(f"WARN: '{sym}' looks like forex but isn't XXX.YYY; skipping")
+            else:
+                # US equity via SMART. Pinning primaryExchange='NASDAQ' helps
+                # IBKR disambiguate tickers that exist on multiple exchanges
+                # (UPC and similar). If the actual primary is e.g. NYSE,
+                # qualifyContractsAsync will rewrite it for us.
+                contract = Stock(s_norm, "SMART", "USD", primaryExchange="NASDAQ")
+                probes.append((f"{s_norm} (US equity, SMART/NASDAQ primary)", contract, "TRADES"))
 
         for label, raw_contract, what_to_show in probes:
             print(f"\n=== Probe: {label} ===")
@@ -135,6 +165,15 @@ async def main() -> None:
                 results[label] = {"status": "qualify_failed"}
                 continue
             contract = qualified[0]
+            # Show what IBKR actually resolved the contract to (helps catch
+            # ambiguous symbols routed to the wrong exchange).
+            print(
+                f"  qualified      : conId={contract.conId} "
+                f"symbol={contract.symbol} "
+                f"primaryExchange={getattr(contract, 'primaryExchange', '?')} "
+                f"exchange={contract.exchange} "
+                f"localSymbol={contract.localSymbol}"
+            )
 
             ticker = ib.reqMktData(contract, "", False, False)
             mdt = 0

@@ -62,8 +62,59 @@ engine yet.
 
 ### Open follow-ups (pick up here)
 
-Last session ended Mon 15 Jun ~23:10 Perth with everything pushed and
-the engine stopped manually. Pickup priorities for the next session:
+Last session ended Tue 16 Jun ~21:00 Perth. Servers stopped, repo pushed.
+
+**FIRST THING TOMORROW** — IBKR market data subscription propagation
+check:
+
+Tue 16 Jun, Jason subscribed to NASDAQ L1 + L2 (TotalView-OpenView)
++ NYSE A/B + Snapshot Bundle (~AUD 43.84/mo) on Individual account
+U21585867 (which also bills the Trust account U23755393, and the
+linked paper DUM733674). All correct on paper. **TWS desktop receives
+the live data**, but the API was consistently denied with:
+
+```
+Error 10089: AAPL NASDAQ.NMS/TOP/ALL
+"Requested market data requires additional subscription for API"
+```
+
+Configuration confirmed sound:
+- Market Data API Acknowledgement signed 2026-06-13 ✓
+- Non-Professional Subscriber status certified ✓
+- Subs marked active on Individual account ✓
+- Paper account DUM733674 linked correctly ✓
+
+Strong hypothesis: **IBKR subscription→API propagation latency**.
+Desktop client refreshes its permission cache eagerly; the API path
+requires a deeper backend sync that can take 2-24 hours for first-time
+paid subs. Should be resolved overnight.
+
+**Test sequence in the morning:**
+1. Boot servers: backend on `:8000`, frontend on `:3000` (Postgres
+   container `prism-local-db` should already be running; if not,
+   `docker start prism-local-db`).
+2. Make sure TWS is up, logged into paper `DUM733674`, **and** no
+   other IBKR session is active anywhere (mobile app, web portal,
+   second TWS instance) — Error 162 "different IP address" tonight
+   was caused by a stale web session.
+3. Re-probe: `cd backend && uv run python ../scripts/ibkr_check.py AAPL UPC --only`
+4. Expected: `bid/ask` shows real numbers (not `nan`), `rt/10s ≥ 1`.
+   If yes → arm UPC pre-market via `/engine`.
+5. If still `nan` after a fresh morning: contact IBKR support to
+   escalate. Reference the consistent Error 10089 on `NASDAQ.NMS/TOP/ALL`
+   despite all confirmations. They can manually force a permission
+   refresh.
+6. If subs really can't be made to work on this paper account, the
+   ~AUD 50 is refundable pro-rata via Client Portal → Settings →
+   Market Data Subscriptions → cancel.
+
+While waiting for IBKR to sort itself, the rest of the engine is in
+the same state as the prior pickup (forex tested overnight, live
+forming candle code in place but visually unconfirmed). Forex
+EUR.USD remains free and works fine if you want to validate engine
+changes without paid US equity data.
+
+**Prior session priorities (still valid):**
 
 1. **Live forming candle not visibly updating in the browser** despite
    the backend code being in place (commit `9083618`). When the chart
