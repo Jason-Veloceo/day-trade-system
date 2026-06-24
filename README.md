@@ -67,8 +67,24 @@ engine yet.
 
 ### Recently landed
 
+- **2-day bootstrap + `require_5m_macd` toggle** (Wed 24 Jun PM): the
+  engine now requests `durationStr="2 D"` of 1m historical bars on
+  Arm (previously 4 hours), so 5m MACD warms instantly via
+  TradingView-style cross-session carry-through. The earlier 4-hour
+  window broke on fresh Ross-scanner movers: e.g. FRTT had only 78
+  1m bars at arm time (~16 5m bars), well short of the ~26 5m bars
+  needed for MACD(12/26/9), so `macd_5m_hist` returned `None` and the
+  trend gate failed with "5m MACD not warmed up yet". The 2-day
+  window includes yesterday's session, giving 600+ 1m bars / 120+ 5m
+  bars on any actively-traded name. New `require_5m_macd: bool`
+  toggle on the Arm form (under "Gate stack") lets the user opt out
+  of the 5m gate entirely for fast-pivot scenarios on brand-new
+  movers — the gate then evaluates 1m MACD + VWAP + backside +
+  trigger only. Default ON (safer, Ross-style broader-trend filter).
+  Persisted on the `engine_start` audit event and surfaced on
+  `/engine/status`.
 - **Historical-bar bootstrap** (`183f5da`): on every Arm, the engine
-  pulls 4 hours of 1m bars from IBKR and replays them through the
+  pulls historical 1m bars from IBKR and replays them through the
   strategy + the 5m aggregator so 1m MACD, 5m MACD, VWAP and the
   pullback history are warm immediately. No more 30-minute warm-up
   before the gate stack is meaningful. Replayed signals are discarded;
@@ -85,25 +101,64 @@ engine yet.
   'backend_restart_orphaned'` on the next backend boot. Keeps Recent
   Runs honest.
 
+### Wed 24 Jun PM session — engine validated on live US equities
+
+First two real engine runs on US small-caps, both behaving exactly
+to spec:
+
+- **Run 14: LHSW** — engine armed cleanly, bootstrap pulled 241 1m
+  bars + 48 5m bars from the original 4-hour window, but `macd_5m_hist`
+  returned a stable value. Gate stack evaluated normally. No setup
+  fired (quiet market). Run stopped clean.
+- **Run 15-16: FRTT** — engine armed; on run 15 the gate stack failed
+  with "5m MACD not warmed up yet" (only 78 1m / 16 5m bars from the
+  4-hour window — the trigger that motivated the 2-day bootstrap fix).
+  After the fix landed and we re-armed (run 16), 5m MACD was warm
+  immediately. Gate stack THEN correctly refused FRTT on the **backside
+  veto** ("price below VWAP for 55 consecutive bars (threshold 3)"):
+
+  ```
+  last_entry_gate.passed = False
+  last_entry_gate.failures = [
+    "price below VWAP (3.0400 vs 3.5617)",
+    "backside: price below VWAP for 55 consecutive bars (threshold 3)",
+    "trigger (pullback_break): current bar is not green (close <= open)"
+  ]
+  backside.block = True
+  backside.hard_vetoes = ["price below VWAP for 55 consecutive bars (threshold 3)"]
+  ```
+
+  This is **the most important behavioural validation we could have
+  asked for** — an "inexperienced trader" would have bought FRTT
+  ("look how cheap it is now") and chopped to death; the engine saw
+  the backside structure and refused. The Ross-style discipline
+  encoded in `backside.py` worked on real US equity data on day one.
+- **IBKR Warning 2152** fired on both LHSW and FRTT depth
+  subscriptions: "Need additional market data permissions - Depth:
+  NASDAQ; BATS; ARCA; BEX; NYSE". This is informational, not
+  blocking. With `isSmartDepth=True` (engine default) IBKR returns
+  IEX full depth + top-of-book from ~14 other exchanges
+  (BYX/AMEX/PEARL/T24X/MEMX/EDGEA/etc.) aggregated as "smart depth".
+  Our `ibkr_l2_check.py` smoke probe sees the same picture: real
+  multi-level book with DRCTEDGE/MEMX/PEARL/EDGEA/CHX/BYX market
+  makers — sufficient for Bookmap-style features (resting walls,
+  aggressor imbalance, absorption, sweeps). True multi-level NASDAQ
+  TotalView depth would require `isSmartDepth=False` with explicit
+  `exchange="ISLAND"` routing, but is not required for our use case.
+
 ### Open follow-ups (pick up here)
 
-Last session ended Wed 24 Jun ~20:00 Perth. Servers stopped, repo
-pushed.
+Last session ended Wed 24 Jun ~21:20 Perth (Wed pre-market US close-out).
+Servers stopped, repo pushed. **The IBKR data block from Mon 22 Jun
+is fully resolved** and the engine has now been validated end-to-end
+on two live US small-caps (LHSW, FRTT) with the gate stack correctly
+refusing both on the backside veto.
 
-**The IBKR data block from Mon 22 Jun is fully resolved.** Wed 24 Jun
-confirmed:
-
-- L1 quotes flow via API on US equities (FRTT live bid/ask).
-- L2 (NASDAQ TotalView) flows via API (`reqMktDepth`, ~21 updates/sec
-  on FRTT) — multiple market makers visible.
-- T&S flows via API (`reqTickByTickData("AllLast")`, ~18 prints/sec).
-- BBO flows via API (`reqTickByTickData("BidAsk")`, ~18 updates/sec).
-- Marketable LMT round-trip filled cleanly (`manual_trade_test.py FRTT 10`).
-- Account routing: still using **original paper `DUM733674`** — once
-  the Trust funding cleared, entitlements propagated user-wide and
-  DUM733674 inherited them. The new paper `DUQ861843` (username
-  `flingwing007`) was created as a fallback but is not needed for
-  data access. Either account works.
+Account routing: still using **original paper `DUM733674`** — once
+the Trust funding cleared, entitlements propagated user-wide and
+DUM733674 inherited them. The new paper `DUQ861843` (username
+`flingwing007`) was created as a fallback but is not needed for
+data access. Either account works.
 
 History (kept for context):
 | IBKR account | Subscriptions? | Linked paper? | Funded? |
@@ -111,92 +166,131 @@ History (kept for context):
 | U21585867 Individual | None | `DUM733674` (primary) | N/A |
 | U23755393 Trust | ✅ ~AUD 47/mo (NASDAQ L1+L2, NYSE A/B, Snapshot) | `DUQ861843` (username `flingwing007`, spare) | AUD 4,000 funded |
 
-**Tools added Wed 24 Jun:**
+**THE NEXT BIG SLICE — Multi-engine concurrent monitoring with
+execution mutex.**
 
-- `scripts/ibkr_l2_check.py` — standalone L2 + T&S smoke probe. Calls
-  `reqMktDepth` + `reqTickByTickData("AllLast")` +
-  `reqTickByTickData("BidAsk")` against a symbol for N seconds and
-  reports counts + a one-shot L2 ladder snapshot. Use before arming
-  the engine to confirm the data layer is healthy:
-  ```bash
-  cd backend && uv run python ../scripts/ibkr_l2_check.py FRTT 20
-  ```
+Ross typically has 3-5 movers alerting on his scanners simultaneously,
+and the current "one engine at a time" runner singleton forces the
+user to manually rotate between candidates — which costs attention
+and risks missing the actual setup. The user's stated requirement
+(Wed 24 Jun PM):
 
-**FIRST THING TOMORROW** — arm the engine on a live US small-cap:
+> "I want to monitor up to 4 stocks at once. When one triggers and
+>  I take the trade, the others become non-tradable until the
+>  position is exited."
 
-The infrastructure work is done. The next slice is to actually run
-the v1.2 engine against a live NASDAQ mover and watch the gate stack
-evaluate against real data for the first time on US equities.
+This is **multi-watch, mutex-execute** semantics. Sketch:
 
-Test sequence:
-1. **Start services**: backend on `:8000`, frontend on `:3000`,
-   Postgres container `prism-local-db` running. TWS logged into
-   paper (`DUM733674`).
-2. **Data smoke** (1 min): re-run
-   `cd backend && uv run python ../scripts/ibkr_l2_check.py FRTT 10`
-   to confirm L2+T&S are still flowing this session.
-3. **Pick a live mover.** Either pull a name from the DTD scanner or
-   use whatever Ross is on for the day. NASDAQ small-caps preferred
-   (NASDAQ.SCM tradingClass), price $1.50 - $20.
-4. **Arm at `/engine`**:
-   - Symbol: the ticker
-   - **Order type: LMT** (NOT MKT — see executor docstring; LMT gives
-     ask+offset / bid-offset Ross-hotkey mirror, MKT does not)
-   - Entry trigger: `pullback_break` (Ross-style) for the mover case;
-     `macd_cross` works as the simpler legacy POC
-   - Sell anchor: `bid` (aggressive, default; mirrors "Sell at Bid")
-   - Position size: small (10 shares is fine for first US equity engine
-     test)
-   - Stop mode: `pullback_low`
-5. **Watch the dashboard**:
-   - Strategy state panel should show 1m MACD + 5m MACD + VWAP warm
-     immediately (historical bootstrap pre-loads them).
-   - Live event log should journal bar closes, gate evaluations, and
-     any signals.
-   - Chart should plot 1m candles + (if live forming candle is
-     visibly working — still pending verify) tick-by-tick rightmost
-     candle updates every 5 seconds.
-6. **Do NOT auto-arm**. Watch the first few cycles, then Stop. We
-   want to see the engine's behaviour, not let it loose unsupervised
-   on its first live US equity run.
+```
+EngineRegistry (replaces EngineRunner singleton)
+  dict[symbol, TradingEngine]
+  start(symbol, ...) -> add engine, no global lock
+  stop(symbol) -> stop specific engine
+  active() -> list of all running engines
+       |
+       v
+TradingEngine x N (one per symbol, fully independent)
+  - own BarFeed, indicators, gate stack, exits
+  - subscribes to its own L2/T&S/quote
+       |
+       v on entry signal
+PortfolioRiskGate (NEW)
+  - try_acquire_for_entry(run_id) -> bool, atomic
+  - release(run_id)
+  - holds the "any engine in a position?" mutex
+  - blocks other engines' entries while one holds a position
+  - releases on position-flat (any exit reason)
+```
 
-**Then plan the L2/T&S feature layer (Bookmap-style)** — the big
-next slice, ideated Wed 24 Jun. The infrastructure is open, the
-engine has scaffolded `orderbook.py` + `features.py`, and we need
-to validate against Ross's actual decision-making patterns before
-writing code. Plan first; code after.
+When the mutex blocks an entry, the engine still journals
+`blocked_by_portfolio_mutex` with the gate state — so the user has
+a paper trail of "this would have fired too". Cross-engine risk
+caps (e.g. portfolio-wide `max_daily_loss_usd`) consult the same
+shared state.
+
+Scope estimate: **3-4 days of focused work.**
+
+| Layer | Change | Effort |
+|---|---|---|
+| `engine/runner.py` | `EngineRunner` → `EngineRegistry`; methods take a `symbol` parameter; remove the `EngineBusyError` constraint | ~0.5 day |
+| NEW `engine/portfolio_risk.py` | `PortfolioRiskGate` with asyncio.Lock-serialised try-acquire/release; mutex leakage recovery via IBKR position reconciliation | ~0.5 day |
+| `engine/engine.py` | Gate every order submission via `PortfolioRiskGate.try_acquire`; release on position-flat; audit blocked attempts | ~0.5 day |
+| `engine/ibkr_client.py` | No change — already supports multiple concurrent subscriptions on one connection. Keep single `clientId` for now (revisit if we ever need per-engine isolation) | 0 |
+| `api/engine.py` | `/engine/start` allows multiple; `/engine/stop?symbol=X`; `/engine/status` returns `{engines: [...]}` ; new `/engine/portfolio` for mutex state | ~0.5 day |
+| `frontend/src/app/engine/page.tsx` | Multi-card dashboard; "+ Add Engine" button; visual lockout indicator when mutex is held by another engine | ~1-1.5 days |
+| Testing + audit | Mutex acquire/release lifecycle across partial fills, cancellations, distress exits; orphan-mutex recovery on backend restart | ~0.5 day |
+
+Key open design questions to resolve BEFORE coding:
+
+1. **What is "non-tradable" exactly?** Suggested: engine still
+   evaluates gates and emits `entry_signal` events to the audit log,
+   but on the order-submission step it sees the mutex held and
+   journals `blocked_by_portfolio_mutex` without submitting. Continues
+   monitoring normally. Alternative: full freeze (no gate evaluation
+   either) — saves CPU but loses observability.
+2. **Mutex release timing.** Release on `position.qty == 0` after a
+   confirmed fill of the exit order? Or on the exit-trigger firing
+   (before the exit-order fills)? The former is safer (no double-
+   entry risk). The latter is faster but needs careful handling of
+   partial-fill scenarios.
+3. **Mutex leak recovery.** If the engine that held the mutex
+   crashes mid-trade, the mutex stays held. On `EngineRegistry`
+   restart, query IBKR for actual account positions and reconcile —
+   if no open positions exist, release the mutex; if positions
+   exist, identify which engine owns them and re-attach.
+4. **Per-engine vs portfolio risk caps.** Today `max_daily_loss_usd`
+   is per-engine. With multiple engines, almost certainly we want
+   **portfolio-level** — total daily loss across all engines combined.
+   Same for `max_position_value_usd` and trade-count caps. New
+   `PortfolioRiskCaps` config, separate from per-engine `RiskCaps`.
+5. **UI layout.** Vertical stack of 4 cards? Grid? Collapsible
+   cards? My instinct: 2x2 grid with expand-to-inspect modal.
+
+**Interim option (~2 hours) being considered**: a "Swap Symbol"
+button on the single-engine dashboard that atomically stops the
+current engine and arms a new one in a single click. Lower
+complexity, lets the user rotate through Ross-scanner candidates
+faster. NOT multi-engine — still one at a time. Decide tomorrow.
+
+**Other follow-ups (still open, lower priority than multi-engine):**
+
+- **Plan the L2/T&S feature layer (Bookmap-style)** — the infrastructure
+  is open, the engine has scaffolded `orderbook.py` + `features.py`,
+  and we need to validate against Ross's actual decision-making
+  patterns before writing code. Plan first; code after. The smart-
+  aggregated depth (IEX + top-of-book from ~14 exchanges) we get
+  via `isSmartDepth=True` is sufficient for resting wall, aggressor
+  imbalance, absorption, and sweep detection.
+- **Manual force-entry button** ("Buy Now") for cases where the user
+  has personal conviction on a setup that the engine's trigger
+  hasn't fired on (e.g. user joining a hot mover late). Submits the
+  configured LMT@ask+offset order with all risk caps applied; engine
+  then manages the position with normal exit triggers. Discussed
+  Wed 24 Jun PM, parked for post-multi-engine.
+- **10-second chart visualization** — aggregate IBKR 5s real-time
+  bars into 10s candles for fast tape-reading-style chart view.
+  UX upgrade only; strategy decisions still 1m bar-close driven.
+  Parked for post-multi-engine.
+- **Live forming candle not visibly updating in browser** despite
+  backend code in place (`9083618`). Backend publishes
+  `engine.bar_tick` every 5s; frontend doesn't appear to redraw.
+  Diagnose:
+  - DevTools → Network → WS frames; filter `engine.bar_tick`. If
+    arriving: bug in `EngineChart.tsx` `bar_tick` branch or in
+    `ENGINE_TOPICS` filter on `engine/page.tsx`.
+  - If not arriving: bug backend-side; verify
+    `BarFeed._on_partial_bar` is firing and
+    `TradingEngine._on_partial_bar` is publishing.
+- **`test_bars.py` unit test** for the minute-aggregation + the
+  `on_partial_bar` callback. We don't currently exercise `BarFeed`
+  in tests.
+- **Verify orphan sweep ran clean** on next backend startup; grep
+  log for `swept N orphaned engine_run row(s)`.
 
 **Code-side: no .env changes needed.** Host/port/client_id/trading
 mode all stay the same. `IBKR_TARGET_ACCOUNT` is intentionally
 blank — the paper login exposes one DU* account
 (`DUM733674` currently) and the engine picks that up automatically.
-
-**Prior session priorities (still valid):**
-
-1. **Live forming candle not visibly updating in the browser** despite
-   the backend code being in place (commit `9083618`). When the chart
-   rendered EUR.USD overnight-test it still only redrew on minute
-   close. Diagnose path:
-   - Open `/engine` with DevTools → Network → WS frames. Filter for
-     `engine.bar_tick`. Confirm the messages are arriving from the
-     backend at ~5s cadence with `payload.event_type === "bar_tick"`.
-   - If they ARE arriving: the bug is in `frontend/src/components/EngineChart.tsx`
-     (the new `if (type === "bar_tick")` branch in effect #3) or in
-     `frontend/src/app/engine/page.tsx` (the `ENGINE_TOPICS` filter,
-     which we did add `engine.bar_tick` to). Likely Next.js HMR didn't
-     pick up the new effect — try a full restart of `npm run dev`.
-   - If they are NOT arriving: the bug is backend-side. Check that
-     `BarFeed._on_partial_bar` is being scheduled in `_ingest` (it
-     fires unconditionally now), and that `TradingEngine._on_partial_bar`
-     is actually publishing. Add a temporary `logger.debug("bar_tick %s", snapshot.ts)`
-     to confirm.
-2. **Verify the orphan sweep ran**: on backend startup, grep the log
-   for `swept N orphaned engine_run row(s)`. There should be 0 next
-   time (we cleaned them all manually + via the new sweep landed in
-   `9083618`).
-3. **Optional**: add a `test_bars.py` unit test covering both the
-   minute-aggregation behaviour and the new `on_partial_bar` callback.
-   We do not currently exercise `BarFeed` in tests.
 
 ### Earlier fix worth knowing about
 

@@ -92,6 +92,7 @@ const DEFAULT_START: EngineStartIn = {
   cancel_lmt_after_seconds: 3,
   enable_depth: false,
   enable_tape: false,
+  require_5m_macd: true,
   dtd_context: DEFAULT_DTD,
 };
 
@@ -505,6 +506,21 @@ function StartForm({
           />
         </div>
       </div>
+
+      {/* Gate configuration (first_pullback only) */}
+      {isFirstPullback ? (
+        <div className="rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3">
+          <div className="text-xs font-semibold text-neutral-600">Gate stack</div>
+          <div className="mt-2">
+            <Toggle
+              label="Require 5m MACD (broader trend filter)"
+              checked={form.require_5m_macd}
+              onChange={(v) => setForm({ ...form, require_5m_macd: v })}
+              hint="ON (recommended): Ross-style — gate requires 5m MACD histogram > 0 and not falling. Filters fake-outs but blocks entries on brand-new movers (5m MACD needs ~26 5m bars = ~130 min of trading history to warm up). OFF: trade off 1m MACD + VWAP + backside + trigger only. Useful for fast-pivot scenarios on fresh Ross-scanner alerts."
+            />
+          </div>
+        </div>
+      ) : null}
 
       {/* DTD context (only for first_pullback) */}
       {isFirstPullback ? <DtdContextFields form={form} setForm={setForm} /> : null}

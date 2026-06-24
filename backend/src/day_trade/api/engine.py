@@ -82,6 +82,12 @@ class StartIn(BaseModel):
     cancel_lmt_after_seconds: float = Field(3.0, ge=0.5, le=120.0)
     enable_depth: bool = False
     enable_tape: bool = False
+    # When True (default): the FirstPullback gate requires 5m MACD positive
+    # and not falling - Ross's broader-trend filter. When False: ignore the
+    # 5m MACD entirely (1m MACD + VWAP + backside + trigger only). Useful
+    # for fast-pivot scenarios on brand-new movers where 5m MACD hasn't
+    # warmed up (needs ~26 5m bars = ~130 minutes of trading history).
+    require_5m_macd: bool = True
     dtd_context: DtdContextIn = Field(default_factory=DtdContextIn)
 
 
@@ -113,6 +119,7 @@ class StatusOut(BaseModel):
     cancel_lmt_after_seconds: float | None = None
     enable_depth: bool | None = None
     enable_tape: bool | None = None
+    require_5m_macd: bool | None = None
     dtd_context: dict[str, Any] | None = None
     risk_state: dict[str, Any] | None = None
     strategy_state: dict[str, Any] | None = None
@@ -229,6 +236,7 @@ async def start(body: StartIn) -> StartOut:
             cancel_lmt_after_seconds=body.cancel_lmt_after_seconds,
             enable_depth=body.enable_depth,
             enable_tape=body.enable_tape,
+            require_5m_macd=body.require_5m_macd,
             dtd_context=body.dtd_context.model_dump(exclude_none=True),
         )
     except EngineBusyError as e:

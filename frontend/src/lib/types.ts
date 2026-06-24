@@ -119,6 +119,7 @@ export interface EngineStartIn {
   cancel_lmt_after_seconds: number;
   enable_depth: boolean;
   enable_tape: boolean;
+  require_5m_macd: boolean;
   dtd_context: EngineDtdContext;
 }
 
@@ -160,6 +161,7 @@ export interface EngineStatus {
   cancel_lmt_after_seconds?: number | null;
   enable_depth?: boolean | null;
   enable_tape?: boolean | null;
+  require_5m_macd?: boolean | null;
   dtd_context?: EngineDtdContext | null;
   risk_state?: {
     trades_count: number;

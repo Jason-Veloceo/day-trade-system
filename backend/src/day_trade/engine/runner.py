@@ -57,6 +57,7 @@ class EngineRunner:
         cancel_lmt_after_seconds: float = 3.0,
         enable_depth: bool = False,
         enable_tape: bool = False,
+        require_5m_macd: bool = True,
         dtd_context: dict[str, Any] | None = None,
     ) -> int:
         async with self._lock:
@@ -78,6 +79,7 @@ class EngineRunner:
                 cancel_lmt_after_seconds=cancel_lmt_after_seconds,
                 enable_depth=enable_depth,
                 enable_tape=enable_tape,
+                require_5m_macd=require_5m_macd,
                 dtd_context=dict(dtd_context or {}),
             )
             engine = TradingEngine(
@@ -90,9 +92,9 @@ class EngineRunner:
             self._engine = engine
             logger.info(
                 "EngineRunner started run_id=%s symbol=%s strategy=%s autonomous=%s "
-                "order_type=%s sell_anchor=%s depth=%s tape=%s",
+                "order_type=%s sell_anchor=%s depth=%s tape=%s require_5m_macd=%s",
                 run_id, symbol, strategy_name, autonomous,
-                order_type, sell_anchor, enable_depth, enable_tape,
+                order_type, sell_anchor, enable_depth, enable_tape, require_5m_macd,
             )
             return run_id
 
@@ -139,6 +141,7 @@ class EngineRunner:
             "cancel_lmt_after_seconds": e.config.cancel_lmt_after_seconds,
             "enable_depth": e.config.enable_depth,
             "enable_tape": e.config.enable_tape,
+            "require_5m_macd": e.config.require_5m_macd,
             "dtd_context": dict(e.config.dtd_context),
             "risk_state": {
                 "trades_count": e.risk.state.trades_count if e.risk else 0,

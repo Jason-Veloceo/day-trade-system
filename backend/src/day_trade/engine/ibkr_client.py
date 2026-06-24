@@ -190,7 +190,7 @@ class IBKRClient:
         self,
         contract: Contract,
         what_to_show: str,
-        duration_seconds: int,
+        duration_str: str,
         use_rth: bool = False,
     ) -> list:
         """Pull recent historical 1-minute bars for indicator warm-up at
@@ -198,14 +198,22 @@ class IBKRClient:
         `.open`, `.high`, `.low`, `.close`, `.volume`). Caller is responsible
         for converting to the engine's internal Bar type.
 
-        `duration_seconds` is the lookback window. 90 minutes (5400s) is the
-        practical minimum for 1m MACD(12, 26, 9) to fully warm up; 4 hours
-        (14400s) covers 5m MACD warm-up too (~30 5m bars).
+        `duration_str` is the IBKR-format lookback window. Examples:
+            "5400 S"  -> 90 minutes (1m MACD warm-up only)
+            "4 H"     -> 4 hours
+            "1 D"     -> 1 trading day
+            "2 D"     -> 2 trading days (recommended for 5m MACD warm-up:
+                         IBKR fills in prior-day's session for hot-start
+                         on fresh movers, mirroring TradingView's MACD
+                         carry-through behaviour across session boundaries)
+
+        For 1m barSizeSetting, IBKR caps the "S" form at ~2000 bars (~33h);
+        prefer "D" or longer for multi-session warm-up.
         """
         return await self._ib.reqHistoricalDataAsync(
             contract,
             endDateTime="",
-            durationStr=f"{int(duration_seconds)} S",
+            durationStr=duration_str,
             barSizeSetting="1 min",
             whatToShow=what_to_show,
             useRTH=use_rth,

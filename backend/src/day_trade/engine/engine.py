@@ -95,6 +95,14 @@ class EngineConfig:
     cancel_lmt_after_seconds: float = 3.0
     enable_depth: bool = False
     enable_tape: bool = False
+    # When True (default, safer): the FirstPullback gate requires 5m MACD
+    # histogram > 0 and not falling, which is Ross's "broader trend filter".
+    # When False: the engine ignores 5m MACD entirely and trades off 1m MACD
+    # + VWAP + backside + trigger only. Useful for fast-pivot scenarios on
+    # brand-new movers where 5m MACD hasn't warmed up yet (needs ~26 5m bars
+    # = ~130 minutes of trading history). Caveat emptor: trading without the
+    # 5m context filter catches more false starts.
+    require_5m_macd: bool = True
     dtd_context: dict[str, Any] = field(default_factory=dict)
 
 
@@ -159,7 +167,25 @@ class TradingEngine:
         self.run_id = run_id
         self.journal = Journal(run_id=run_id, broker=self.broker)
 
-        self.strategy = get_strategy(self.config.strategy_name)(**self.config.strategy_params)
+        # Strategy params can include a `trend` (TrendGateConfig) for the
+        # FirstPullback family. We respect anything the caller passed explicitly,
+        # but if the caller is using the simple `require_5m_macd` boolean toggle
+        # and hasn't provided their own `trend`, we synthesize one here so the
+        # engine config and strategy config stay consistent.
+        strategy_params = dict(self.config.strategy_params)
+        if (
+            self.config.strategy_name == "first_pullback_long"
+            and not self.config.require_5m_macd
+            and "trend" not in strategy_params
+        ):
+            from .strategies.first_pullback_long import TrendGateConfig
+
+            strategy_params["trend"] = TrendGateConfig(
+                require_5m_histogram_positive=False,
+                require_5m_histogram_not_falling=False,
+            )
+
+        self.strategy = get_strategy(self.config.strategy_name)(**strategy_params)
         self.risk = RiskGate(self.settings, self.config.risk_caps)
         self.exits = ExitTriggerSet(getattr(self.strategy, "exit_cfg", ExitConfig()))
 
@@ -225,6 +251,7 @@ class TradingEngine:
                 "sell_anchor": self.config.sell_anchor,
                 "enable_depth": self.config.enable_depth,
                 "enable_tape": self.config.enable_tape,
+                "require_5m_macd": self.config.require_5m_macd,
                 "ibkr_account": self.ibkr.account,
                 "market_data_type": self.settings.ibkr_market_data_type,
                 "risk_caps": self._risk_caps_dict(),
@@ -280,15 +307,26 @@ class TradingEngine:
         assert self.tf5 is not None
         assert self.journal is not None
 
-        # 4 hours (14400s) is enough to fully warm 5m MACD(12/26/9) - 26x5 = 130
-        # bars - while still being well inside IBKR's reqHistoricalData limits
-        # for 1-minute bars on any instrument we care about (forex / US equity).
-        duration_seconds = 4 * 60 * 60
+        # 2 trading days of 1m bars. This is the TradingView-style "carry
+        # through across session boundaries" approach: 5m MACD warms instantly
+        # on any name that traded yesterday (even a fresh Ross-scanner pivot
+        # mid-session). A 4-hour window was insufficient for hot-start: e.g.
+        # FRTT's first 80 minutes of pre-market yields only 16 5m bars, but
+        # 5m MACD(12/26/9) needs ~26 5m bars to compute. With "2 D" IBKR
+        # returns yesterday's full session + today-so-far, comfortably warming
+        # both timeframes.
+        #
+        # Trade-off: cross-session MACD inherits any overnight gap as a real
+        # bar (so a +400% gap-up reads as "huge histogram"). For our intended
+        # use case (catching gap-and-go small caps) this signal is feature,
+        # not bug - it tells the strategy "this is on the front side of a
+        # massive move", which is what we want.
+        duration_str = "2 D"
 
         raw_bars = await self.ibkr.fetch_historical_1m_bars(
             contract,
             self.spec.what_to_show,
-            duration_seconds=duration_seconds,
+            duration_str=duration_str,
             use_rth=False,
         )
         if not raw_bars:
