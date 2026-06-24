@@ -9,19 +9,44 @@ strategy on small-cap US equities, with forex as a 24-hour smoke-test rail.
 > `PAPER_TRADING_ONLY=true`); the system refuses to submit orders outside
 > paper.
 
-## Current state — June 15, 2026
+## Current state — June 24, 2026
 
 **v1.2 semi-automated FirstPullback engine** is the active surface. Visit
 `/engine`. You arm a single symbol (the human picks it — currently no
 auto-promotion from DTD), the engine watches the gate stack, and submits
 paper orders via IBKR TWS.
 
-Verified end-to-end against `VSME` on paper account `DUM733674`: contract
-qualified through SMART → NASDAQ, engine started, `engine_start` +
-`ibkr_connected` events written, clean stop. EUR.USD on IDEALPRO is the
-current overnight smoke rail and streams bars cleanly under the new
-historical-bar bootstrap (MACD/VWAP warm up immediately, no 30-minute
-wait).
+**🎯 Major unblock on Wed 24 Jun**: full L1 + L2 (NASDAQ TotalView) + T&S
++ historical + real-time bars are now **all flowing via the API on paper
+account `DUM733674`**. The wrong-account-routing hypothesis was correct;
+once the Trust account `U23755393` cleared the USD 500 funding minimum,
+IBKR propagated entitlements user-wide and the original paper account
+inherited live equity data overnight. We confirmed end-to-end on FRTT
+(a +70% small-cap mover with multiple volatility halts that day):
+
+- **L2** via `reqMktDepth(numRows=10, isSmartDepth=True)`:
+  ~21 updates/sec, real ladder with DRCTEDGE, MEMX, PEARL, EDGEA, CHX,
+  BYX market makers visible.
+- **T&S** via `reqTickByTickData('AllLast')`: ~18 prints/sec, multi-exchange
+  tape (FINRA, ARCA, NASDAQ).
+- **BBO** via `reqTickByTickData('BidAsk')`: ~18 updates/sec.
+- **Marketable LMT round-trip via the API**:
+  `scripts/manual_trade_test.py FRTT 10` filled BUY @ 3.18 and SELL @ 3.17
+  with price improvement on both sides; total cycle 13s, P&L ~-$0.10
+  (spread).
+
+Previous successful round-trip on Mon 22 Jun (SKYQ 10 shares pre-market)
+remains the original proof that order plumbing works.
+
+The engine's `engine/orderbook.py` + `engine/features.py` layers, which
+were scaffolded but never exercised, are now unblocked. The natural next
+build is the Bookmap-style L2/T&S feature layer (resting wall detection,
+aggressor imbalance, absorption, sweep / spoof detection) — see the
+"Open follow-ups" section below.
+
+EUR.USD on IDEALPRO is still the overnight smoke rail and streams bars
+cleanly under the historical-bar bootstrap (MACD/VWAP warm up
+immediately, no 30-minute wait).
 
 The earlier DTD scanner/funnel work (`/candidates`, `/rules`, `/rejected`,
 `scripts/dtd_*.py`) is **still in the repo but on hold** since the pivot
@@ -62,57 +87,89 @@ engine yet.
 
 ### Open follow-ups (pick up here)
 
-Last session ended Tue 16 Jun ~21:00 Perth. Servers stopped, repo pushed.
+Last session ended Wed 24 Jun ~20:00 Perth. Servers stopped, repo
+pushed.
 
-**FIRST THING TOMORROW** — IBKR market data subscription propagation
-check:
+**The IBKR data block from Mon 22 Jun is fully resolved.** Wed 24 Jun
+confirmed:
 
-Tue 16 Jun, Jason subscribed to NASDAQ L1 + L2 (TotalView-OpenView)
-+ NYSE A/B + Snapshot Bundle (~AUD 43.84/mo) on Individual account
-U21585867 (which also bills the Trust account U23755393, and the
-linked paper DUM733674). All correct on paper. **TWS desktop receives
-the live data**, but the API was consistently denied with:
+- L1 quotes flow via API on US equities (FRTT live bid/ask).
+- L2 (NASDAQ TotalView) flows via API (`reqMktDepth`, ~21 updates/sec
+  on FRTT) — multiple market makers visible.
+- T&S flows via API (`reqTickByTickData("AllLast")`, ~18 prints/sec).
+- BBO flows via API (`reqTickByTickData("BidAsk")`, ~18 updates/sec).
+- Marketable LMT round-trip filled cleanly (`manual_trade_test.py FRTT 10`).
+- Account routing: still using **original paper `DUM733674`** — once
+  the Trust funding cleared, entitlements propagated user-wide and
+  DUM733674 inherited them. The new paper `DUQ861843` (username
+  `flingwing007`) was created as a fallback but is not needed for
+  data access. Either account works.
 
-```
-Error 10089: AAPL NASDAQ.NMS/TOP/ALL
-"Requested market data requires additional subscription for API"
-```
+History (kept for context):
+| IBKR account | Subscriptions? | Linked paper? | Funded? |
+|---|---|---|---|
+| U21585867 Individual | None | `DUM733674` (primary) | N/A |
+| U23755393 Trust | ✅ ~AUD 47/mo (NASDAQ L1+L2, NYSE A/B, Snapshot) | `DUQ861843` (username `flingwing007`, spare) | AUD 4,000 funded |
 
-Configuration confirmed sound:
-- Market Data API Acknowledgement signed 2026-06-13 ✓
-- Non-Professional Subscriber status certified ✓
-- Subs marked active on Individual account ✓
-- Paper account DUM733674 linked correctly ✓
+**Tools added Wed 24 Jun:**
 
-Strong hypothesis: **IBKR subscription→API propagation latency**.
-Desktop client refreshes its permission cache eagerly; the API path
-requires a deeper backend sync that can take 2-24 hours for first-time
-paid subs. Should be resolved overnight.
+- `scripts/ibkr_l2_check.py` — standalone L2 + T&S smoke probe. Calls
+  `reqMktDepth` + `reqTickByTickData("AllLast")` +
+  `reqTickByTickData("BidAsk")` against a symbol for N seconds and
+  reports counts + a one-shot L2 ladder snapshot. Use before arming
+  the engine to confirm the data layer is healthy:
+  ```bash
+  cd backend && uv run python ../scripts/ibkr_l2_check.py FRTT 20
+  ```
 
-**Test sequence in the morning:**
-1. Boot servers: backend on `:8000`, frontend on `:3000` (Postgres
-   container `prism-local-db` should already be running; if not,
-   `docker start prism-local-db`).
-2. Make sure TWS is up, logged into paper `DUM733674`, **and** no
-   other IBKR session is active anywhere (mobile app, web portal,
-   second TWS instance) — Error 162 "different IP address" tonight
-   was caused by a stale web session.
-3. Re-probe: `cd backend && uv run python ../scripts/ibkr_check.py AAPL UPC --only`
-4. Expected: `bid/ask` shows real numbers (not `nan`), `rt/10s ≥ 1`.
-   If yes → arm UPC pre-market via `/engine`.
-5. If still `nan` after a fresh morning: contact IBKR support to
-   escalate. Reference the consistent Error 10089 on `NASDAQ.NMS/TOP/ALL`
-   despite all confirmations. They can manually force a permission
-   refresh.
-6. If subs really can't be made to work on this paper account, the
-   ~AUD 50 is refundable pro-rata via Client Portal → Settings →
-   Market Data Subscriptions → cancel.
+**FIRST THING TOMORROW** — arm the engine on a live US small-cap:
 
-While waiting for IBKR to sort itself, the rest of the engine is in
-the same state as the prior pickup (forex tested overnight, live
-forming candle code in place but visually unconfirmed). Forex
-EUR.USD remains free and works fine if you want to validate engine
-changes without paid US equity data.
+The infrastructure work is done. The next slice is to actually run
+the v1.2 engine against a live NASDAQ mover and watch the gate stack
+evaluate against real data for the first time on US equities.
+
+Test sequence:
+1. **Start services**: backend on `:8000`, frontend on `:3000`,
+   Postgres container `prism-local-db` running. TWS logged into
+   paper (`DUM733674`).
+2. **Data smoke** (1 min): re-run
+   `cd backend && uv run python ../scripts/ibkr_l2_check.py FRTT 10`
+   to confirm L2+T&S are still flowing this session.
+3. **Pick a live mover.** Either pull a name from the DTD scanner or
+   use whatever Ross is on for the day. NASDAQ small-caps preferred
+   (NASDAQ.SCM tradingClass), price $1.50 - $20.
+4. **Arm at `/engine`**:
+   - Symbol: the ticker
+   - **Order type: LMT** (NOT MKT — see executor docstring; LMT gives
+     ask+offset / bid-offset Ross-hotkey mirror, MKT does not)
+   - Entry trigger: `pullback_break` (Ross-style) for the mover case;
+     `macd_cross` works as the simpler legacy POC
+   - Sell anchor: `bid` (aggressive, default; mirrors "Sell at Bid")
+   - Position size: small (10 shares is fine for first US equity engine
+     test)
+   - Stop mode: `pullback_low`
+5. **Watch the dashboard**:
+   - Strategy state panel should show 1m MACD + 5m MACD + VWAP warm
+     immediately (historical bootstrap pre-loads them).
+   - Live event log should journal bar closes, gate evaluations, and
+     any signals.
+   - Chart should plot 1m candles + (if live forming candle is
+     visibly working — still pending verify) tick-by-tick rightmost
+     candle updates every 5 seconds.
+6. **Do NOT auto-arm**. Watch the first few cycles, then Stop. We
+   want to see the engine's behaviour, not let it loose unsupervised
+   on its first live US equity run.
+
+**Then plan the L2/T&S feature layer (Bookmap-style)** — the big
+next slice, ideated Wed 24 Jun. The infrastructure is open, the
+engine has scaffolded `orderbook.py` + `features.py`, and we need
+to validate against Ross's actual decision-making patterns before
+writing code. Plan first; code after.
+
+**Code-side: no .env changes needed.** Host/port/client_id/trading
+mode all stay the same. `IBKR_TARGET_ACCOUNT` is intentionally
+blank — the paper login exposes one DU* account
+(`DUM733674` currently) and the engine picks that up automatically.
 
 **Prior session priorities (still valid):**
 
@@ -306,6 +363,24 @@ Quick standalone IBKR sanity check (no engine, just qualify-and-quote):
 
 ```bash
 cd backend && uv run python ../scripts/ibkr_check.py
+cd backend && uv run python ../scripts/ibkr_check.py UPC SKYQ --only   # probe specific symbols only
+```
+
+L2 (market depth) + T&S (tick-by-tick) API smoke test. Confirms that
+`reqMktDepth` + `reqTickByTickData` are flowing — the data surfaces our
+Bookmap-style feature layer consumes:
+
+```bash
+cd backend && uv run python ../scripts/ibkr_l2_check.py FRTT 20
+```
+
+Direct paper-trade plumbing test (places a real LMT BUY+SELL on the paper
+account, no engine involvement, validates IBKR order submission and
+fills end-to-end). Use with a small qty during pre-market for liquid
+NASDAQ tickers:
+
+```bash
+cd backend && uv run python ../scripts/manual_trade_test.py SKYQ 10
 ```
 
 ## Layout
@@ -373,7 +448,11 @@ strategy_sources/             # knowledge base (doc-only today)
   scenarios.yaml
   assumptions_register.md
 scripts/
-  ibkr_check.py               # standalone IBKR sanity check
+  ibkr_check.py               # standalone IBKR sanity check (L1 quote + bars)
+  ibkr_l2_check.py            # L2 (reqMktDepth) + T&S (reqTickByTickData)
+                              # API smoke; confirms Bookmap-style data layer
+  manual_trade_test.py        # one-off direct paper BUY+SELL via ib-async
+                              # (validates order plumbing without the engine)
   init_db.py                  # seed default DTD rule set
   replay_fixture.py           # DTD fixture replay
   dtd_login.py                # interactive DTD login (one-shot)
