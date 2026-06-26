@@ -1459,6 +1459,13 @@ function StrategyStatePanel({ status }: { status: EngineStatus | undefined }) {
     n === null || n === undefined ? "—" : n.toFixed(4);
   const macd1m = ss.macd_1m_hist ?? ss.macd_histogram;
   const macd5m = ss.macd_5m_hist;
+
+  // macd_crossover_long is a 1m-only momentum probe (no 5m MACD, no
+  // VWAP, no pullback structural state). Render a slim panel so we
+  // don't show misleading "—" placeholders for fields the strategy
+  // doesn't even compute.
+  const isMacdCross = ss.name === "macd_crossover_long";
+
   return (
     <div className="space-y-3 text-sm">
       <KV label="Strategy" value={ss.name} />
@@ -1467,41 +1474,59 @@ function StrategyStatePanel({ status }: { status: EngineStatus | undefined }) {
         value={ss.in_position ? "yes" : "no"}
         accent={ss.in_position ? "sky" : "neutral"}
       />
-      <div className="grid grid-cols-3 gap-3">
-        <Tile
-          label="1m hist"
-          value={fmt(macd1m)}
-          accent={
-            macd1m === null || macd1m === undefined
-              ? "neutral"
-              : macd1m > 0
-              ? "emerald"
-              : "rose"
-          }
-        />
-        <Tile
-          label="5m hist"
-          value={fmt(macd5m)}
-          accent={
-            macd5m === null || macd5m === undefined
-              ? "neutral"
-              : macd5m > 0
-              ? "emerald"
-              : "rose"
-          }
-        />
-        <Tile
-          label="VWAP"
-          value={fmt2(ss.vwap)}
-          accent={
-            ss.vwap_state === "above"
-              ? "emerald"
-              : ss.vwap_state === "below"
-              ? "rose"
-              : "neutral"
-          }
-        />
-      </div>
+      {isMacdCross ? (
+        <div className="grid grid-cols-3 gap-3">
+          <Tile
+            label="1m hist"
+            value={fmt(macd1m)}
+            accent={
+              macd1m === null || macd1m === undefined
+                ? "neutral"
+                : macd1m > 0
+                ? "emerald"
+                : "rose"
+            }
+          />
+          <Tile label="1m MACD line" value={fmt(ss.macd_line)} accent="neutral" />
+          <Tile label="1m signal line" value={fmt(ss.macd_signal)} accent="neutral" />
+        </div>
+      ) : (
+        <div className="grid grid-cols-3 gap-3">
+          <Tile
+            label="1m hist"
+            value={fmt(macd1m)}
+            accent={
+              macd1m === null || macd1m === undefined
+                ? "neutral"
+                : macd1m > 0
+                ? "emerald"
+                : "rose"
+            }
+          />
+          <Tile
+            label="5m hist"
+            value={fmt(macd5m)}
+            accent={
+              macd5m === null || macd5m === undefined
+                ? "neutral"
+                : macd5m > 0
+                ? "emerald"
+                : "rose"
+            }
+          />
+          <Tile
+            label="VWAP"
+            value={fmt2(ss.vwap)}
+            accent={
+              ss.vwap_state === "above"
+                ? "emerald"
+                : ss.vwap_state === "below"
+                ? "rose"
+                : "neutral"
+            }
+          />
+        </div>
+      )}
       {ss.last_trigger ? (
         <div className="rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
           <div className="font-semibold uppercase tracking-wide text-neutral-500">
@@ -1686,14 +1711,34 @@ function fmtPct(n: number | null | undefined): string {
 const FILTERS = [
   "all",
   "bar",
+  "indicator",
   "signal",
   "decision",
+  "ready_for_approval",
+  "order_submit",
   "fill",
   "exit_trigger",
   "risk_block",
   "error",
 ] as const;
 type FilterKey = (typeof FILTERS)[number];
+
+// Friendly labels for the filter pills (event_type strings can be
+// long / underscore-y; this keeps the UI tight without losing precision
+// on the actual filter value).
+const FILTER_LABELS: Record<FilterKey, string> = {
+  all: "all",
+  bar: "bar",
+  indicator: "indicator",
+  signal: "signal",
+  decision: "decision",
+  ready_for_approval: "approval",
+  order_submit: "order",
+  fill: "fill",
+  exit_trigger: "exit",
+  risk_block: "risk",
+  error: "error",
+};
 
 function EventLog({ events }: { events: WsMessage[] }) {
   const [filter, setFilter] = useState<FilterKey>("all");
@@ -1722,7 +1767,7 @@ function EventLog({ events }: { events: WsMessage[] }) {
                 : "bg-white text-neutral-700 ring-neutral-300 hover:bg-neutral-50")
             }
           >
-            {f}
+            {FILTER_LABELS[f]}
           </button>
         ))}
         <span className="ml-auto text-xs text-neutral-500">
@@ -1785,10 +1830,24 @@ function summarise(type: string, p: Record<string, unknown>): string {
     }
     case "indicator": {
       const strat = p.strategy as
-        | { macd_1m_hist?: number; macd_5m_hist?: number; macd_histogram?: number; vwap?: number; vwap_state?: string }
+        | {
+            name?: string;
+            macd_1m_hist?: number;
+            macd_5m_hist?: number;
+            macd_histogram?: number;
+            vwap?: number;
+            vwap_state?: string;
+          }
         | undefined;
       if (!strat) return JSON.stringify(p);
       const m1 = strat.macd_1m_hist ?? strat.macd_histogram;
+      // macd_crossover_long is a 1m-MACD-only strategy by design — it
+      // doesn't compute 5m MACD or VWAP at all. Showing "—" for those
+      // fields would be misleading (the strategy DOESN'T USE them, not
+      // "not warm yet").
+      if (strat.name === "macd_crossover_long") {
+        return `1m=${m1?.toFixed(6) ?? "—"}  (1m MACD only)`;
+      }
       return `1m=${m1?.toFixed(6) ?? "—"} 5m=${strat.macd_5m_hist?.toFixed(6) ?? "—"} vwap=${strat.vwap?.toFixed(4) ?? "—"} (${strat.vwap_state ?? "—"})`;
     }
     case "signal":
