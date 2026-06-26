@@ -2,12 +2,22 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import useSWR from "swr";
-import { approveEngine, fetcher, rejectEngine, startEngine, stopEngine } from "@/lib/api";
+import {
+  approveEngine,
+  fetcher,
+  rejectEngine,
+  resetPortfolioKillSwitch,
+  startEngine,
+  stopAllEngines,
+  stopEngine,
+} from "@/lib/api";
 import type {
   EngineDtdContext,
   EngineFeatureSnapshot,
+  EnginePortfolioStatus,
   EngineRegistryStatus,
   EngineRun,
+  EngineSlotsStatus,
   EngineStartIn,
   EngineStatus,
   WsMessage,
@@ -98,12 +108,10 @@ const DEFAULT_START: EngineStartIn = {
 };
 
 export default function EnginePage() {
-  // v1.3: /engine/status returns the multi-engine registry shape
-  // {engines: [...], portfolio: ..., slots: ...}. This page is still
-  // the single-engine view; the full multi-card dashboard ships in
-  // Phase 1 Day 4. For now we display the first active engine; if more
-  // than one is running, the rest are temporarily not visible here
-  // (but still running on the backend — visit /engine/status to see all).
+  // v1.3 multi-engine dashboard. /engine/status returns the registry
+  // shape {engines: [...], portfolio: {...}, slots: {...}}. The UI is
+  // a sidebar (one card per active engine) + main panel (full detail
+  // of the selected engine, or the Arm-a-symbol form when adding).
   const { data: registry, mutate: refetchStatus } = useSWR<EngineRegistryStatus>(
     "/engine/status",
     fetcher,
@@ -113,18 +121,67 @@ export default function EnginePage() {
     revalidateOnFocus: false,
     refreshInterval: 5000,
   });
-  // Buffer sized to comfortably hold ~100 minutes of activity even with
-  // 12 bar_tick events / minute streaming into the chart.
-  const { messages, connected } = useBrokerStream({ bufferSize: 1500 });
+  // Buffer sized to comfortably hold ~100 minutes of activity for ONE
+  // engine even with 12 bar_tick events / minute. With multi-engine the
+  // shared buffer fills 4x faster — we bump to 4000 to cover all four.
+  const { messages, connected } = useBrokerStream({ bufferSize: 4000 });
 
   const [form, setForm] = useState<EngineStartIn>(DEFAULT_START);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // UI state for the sidebar + main panel.
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  const [addEngineMode, setAddEngineMode] = useState<boolean>(false);
+  // When set, the sidebar card for this symbol shows an inline replace
+  // ticker entry instead of the normal action buttons.
+  const [replaceModeSymbol, setReplaceModeSymbol] = useState<string | null>(null);
+
+  const engines: EngineStatus[] = useMemo(
+    () => registry?.engines ?? [],
+    [registry]
+  );
+  const portfolio = registry?.portfolio;
+  const slots = registry?.slots;
+
+  // Auto-select the first engine if nothing is selected, OR re-select
+  // when the previously-selected engine has been stopped + removed.
+  useEffect(() => {
+    if (engines.length === 0) {
+      if (selectedSymbol !== null) setSelectedSymbol(null);
+      return;
+    }
+    if (selectedSymbol === null || !engines.some((e) => e.symbol === selectedSymbol)) {
+      setSelectedSymbol(engines[0].symbol);
+    }
+  }, [engines, selectedSymbol]);
+
+  // Auto-exit add-engine mode once the engine actually starts.
+  useEffect(() => {
+    if (addEngineMode && engines.some((e) => e.symbol === form.symbol)) {
+      setAddEngineMode(false);
+      setSelectedSymbol(form.symbol);
+    }
+  }, [addEngineMode, engines, form.symbol]);
+
+  const selectedEngine = useMemo(
+    () => engines.find((e) => e.symbol === selectedSymbol),
+    [engines, selectedSymbol]
+  );
+
   const engineEvents = useMemo(
     () => messages.filter((m) => ENGINE_TOPICS.has(m.topic)),
     [messages]
   );
+
+  // Filter the shared WS stream down to the selected engine's events
+  // for the chart + event log. The "Recent runs" panel keeps showing
+  // all runs across all engines.
+  const selectedEngineEvents = useMemo(() => {
+    const rid = selectedEngine?.run_id;
+    if (rid == null) return [];
+    return engineEvents.filter((m) => m.payload?.run_id === rid);
+  }, [engineEvents, selectedEngine?.run_id]);
 
   const lastEventIdRef = useRef<number>(-1);
   useEffect(() => {
@@ -134,17 +191,25 @@ export default function EnginePage() {
     refetchStatus();
   }, [engineEvents.length, refetchStatus]);
 
-  // The single engine this page is currently displaying (the first
-  // active engine in the registry, if any).
-  const engine = useMemo(() => registry?.engines?.[0], [registry]);
-  const active = !!engine;
-  const extraEngines = (registry?.engines?.length ?? 0) - 1;
-
   async function handleStart() {
     setBusy(true);
     setErr(null);
     try {
       await startEngine(form);
+      await refetchStatus();
+      // selectedSymbol will be set to form.symbol by the auto-exit-add
+      // effect once the engine appears in the registry.
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleStopSymbol(symbol: string) {
+    setBusy(true);
+    try {
+      await stopEngine(symbol);
       await refetchStatus();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -153,11 +218,10 @@ export default function EnginePage() {
     }
   }
 
-  async function handleStop() {
-    if (!engine) return;
+  async function handleStopAll() {
     setBusy(true);
     try {
-      await stopEngine(engine.symbol);
+      await stopAllEngines();
       await refetchStatus();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -167,10 +231,10 @@ export default function EnginePage() {
   }
 
   async function handleApprove() {
-    if (!engine) return;
+    if (!selectedEngine) return;
     setBusy(true);
     try {
-      await approveEngine(engine.run_id);
+      await approveEngine(selectedEngine.run_id);
       await refetchStatus();
     } finally {
       setBusy(false);
@@ -178,15 +242,62 @@ export default function EnginePage() {
   }
 
   async function handleReject() {
-    if (!engine) return;
+    if (!selectedEngine) return;
     setBusy(true);
     try {
-      await rejectEngine(engine.run_id);
+      await rejectEngine(selectedEngine.run_id);
       await refetchStatus();
     } finally {
       setBusy(false);
     }
   }
+
+  // Drop-and-Replace: stop the engine running on `oldSymbol`, then
+  // immediately start a new engine on `newSymbol` carrying forward the
+  // old engine's strategy / quantity / risk caps / order routing.
+  async function handleReplace(oldSymbol: string, newSymbol: string) {
+    const old = engines.find((e) => e.symbol === oldSymbol);
+    if (!old) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await stopEngine(oldSymbol);
+      const replacementBody = buildReplacementStartIn(old, newSymbol);
+      await startEngine(replacementBody);
+      setReplaceModeSymbol(null);
+      setSelectedSymbol(newSymbol);
+      await refetchStatus();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleResetKillSwitch() {
+    setBusy(true);
+    try {
+      await resetPortfolioKillSwitch();
+      await refetchStatus();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // When the portfolio mutex is held but NOT by the selected engine,
+  // we show a visual indicator on the main panel: this engine can't
+  // submit entries until the holder closes its position.
+  const blockedByMutex =
+    !!selectedEngine &&
+    !!portfolio?.is_holding &&
+    portfolio?.holder !== selectedEngine.symbol;
+
+  // When the form is open (either no engines OR explicit Add mode), the
+  // sidebar still shows existing engines. The main panel switches to
+  // the start form.
+  const showStartForm = addEngineMode || engines.length === 0;
 
   return (
     <section className="space-y-6">
@@ -194,9 +305,8 @@ export default function EnginePage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-neutral-900">Trading engine</h1>
           <p className="mt-1 text-sm text-neutral-500">
-            Semi-automated FirstPullback / MACD-crossover engine. You arm the symbol (with DTD
-            context), the engine watches the gate stack (5m + 1m MACD, VWAP, backside, L2/T&S)
-            and submits paper orders. Paper-only by hard config.
+            Up to {slots?.max ?? 4} engines monitored at once; only one trades at a time
+            (portfolio execution mutex). Paper-only by hard config.
           </p>
         </div>
         <span
@@ -216,66 +326,144 @@ export default function EnginePage() {
         </span>
       </div>
 
+      <PortfolioTopBar
+        portfolio={portfolio}
+        slots={slots}
+        onResetKillSwitch={handleResetKillSwitch}
+        busy={busy}
+      />
+
       <PendingApprovalBanner
-        status={engine}
+        status={selectedEngine}
         onApprove={handleApprove}
         onReject={handleReject}
         busy={busy}
       />
 
-      {extraEngines > 0 ? (
-        <div className="rounded-xl border border-sky-200 bg-sky-50 px-5 py-3 text-sm text-sky-800 shadow-sm">
-          <span className="font-semibold">Multi-engine note:</span>{" "}
-          {extraEngines} additional engine
-          {extraEngines === 1 ? " is" : "s are"} also running on the backend
-          but {extraEngines === 1 ? "is" : "are"} not displayed on this page yet
-          (single-engine UI). The multi-card dashboard ships in the next slice.
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
+        <EngineSidebar
+          engines={engines}
+          selectedSymbol={selectedSymbol}
+          portfolioHolder={portfolio?.holder ?? null}
+          slotsActive={slots?.active ?? 0}
+          slotsMax={slots?.max ?? 4}
+          replaceModeSymbol={replaceModeSymbol}
+          addEngineMode={addEngineMode}
+          busy={busy}
+          onSelect={(symbol) => {
+            setSelectedSymbol(symbol);
+            setAddEngineMode(false);
+            setReplaceModeSymbol(null);
+          }}
+          onAdd={() => {
+            setAddEngineMode(true);
+            setReplaceModeSymbol(null);
+            setErr(null);
+          }}
+          onCancelAdd={() => {
+            setAddEngineMode(false);
+          }}
+          onStopSymbol={handleStopSymbol}
+          onStopAll={handleStopAll}
+          onStartReplace={(symbol) => {
+            setReplaceModeSymbol(symbol);
+          }}
+          onCancelReplace={() => setReplaceModeSymbol(null)}
+          onCommitReplace={handleReplace}
+        />
+
+        <div className="space-y-6">
+          {showStartForm ? (
+            <Card title="Arm a symbol">
+              <StartForm
+                form={form}
+                setForm={setForm}
+                onStart={handleStart}
+                busy={busy}
+                err={err}
+              />
+            </Card>
+          ) : selectedEngine ? (
+            <>
+              {blockedByMutex ? (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-5 py-3 text-sm text-amber-800 shadow-sm">
+                  <span className="font-semibold">Non-tradable.</span>{" "}
+                  This engine is monitoring {selectedEngine.symbol} but the portfolio mutex
+                  is held by{" "}
+                  <span className="font-mono font-semibold">{portfolio?.holder}</span>{" "}
+                  until that position is flat. Entries will be journaled as
+                  "would-have-fired" until the mutex frees up.
+                </div>
+              ) : null}
+
+              <Card title={`Active run — ${selectedEngine.symbol}`}>
+                <ActiveRunPanel
+                  status={selectedEngine}
+                  onStop={() => handleStopSymbol(selectedEngine.symbol)}
+                  busy={busy}
+                />
+              </Card>
+
+              <Card title="Strategy state">
+                <StrategyStatePanel status={selectedEngine} />
+              </Card>
+
+              <Card title="Live features (L2 / T&S / VWAP)">
+                <FeaturePanel
+                  features={selectedEngine.features ?? null}
+                  enableDepth={selectedEngine.enable_depth ?? false}
+                  enableTape={selectedEngine.enable_tape ?? false}
+                />
+              </Card>
+
+              <Card title="Chart">
+                <EngineChart
+                  runId={selectedEngine.run_id}
+                  symbol={selectedEngine.symbol}
+                  events={selectedEngineEvents}
+                />
+              </Card>
+
+              <Card title="Live event log">
+                <EventLog events={selectedEngineEvents} />
+              </Card>
+            </>
+          ) : null}
+
+          <Card title="Recent runs">
+            <RecentRuns runs={runs} />
+          </Card>
         </div>
-      ) : null}
-
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <Card title={active ? "Active run" : "Arm a symbol"}>
-          {active ? (
-            <ActiveRunPanel status={engine!} onStop={handleStop} busy={busy} />
-          ) : (
-            <StartForm form={form} setForm={setForm} onStart={handleStart} busy={busy} err={err} />
-          )}
-        </Card>
-
-        <Card title="Strategy state">
-          <StrategyStatePanel status={engine} />
-        </Card>
       </div>
-
-      {active ? (
-        <Card title="Live features (L2 / T&S / VWAP)">
-          <FeaturePanel
-            features={engine?.features ?? null}
-            enableDepth={engine?.enable_depth ?? false}
-            enableTape={engine?.enable_tape ?? false}
-          />
-        </Card>
-      ) : null}
-
-      {active && engine?.run_id ? (
-        <Card title="Chart">
-          <EngineChart
-            runId={engine.run_id}
-            symbol={engine.symbol ?? ""}
-            events={engineEvents}
-          />
-        </Card>
-      ) : null}
-
-      <Card title="Live event log">
-        <EventLog events={engineEvents} />
-      </Card>
-
-      <Card title="Recent runs">
-        <RecentRuns runs={runs} />
-      </Card>
     </section>
   );
+}
+
+// Construct a fresh EngineStartIn for a Drop-and-Replace based on the
+// outgoing engine's currently-displayed configuration. We carry forward
+// strategy / quantity / order routing / subscriptions; only the symbol
+// is swapped. The DTD context is dropped (the new symbol is almost
+// certainly a different setup). risk_caps fall back to DEFAULT_START
+// because the backend status endpoint doesn't expose the original
+// configured caps (only the runtime risk_state) — a small Phase 2
+// follow-up; for now the defaults are the same as a fresh Arm.
+function buildReplacementStartIn(old: EngineStatus, newSymbol: string): EngineStartIn {
+  return {
+    symbol: newSymbol,
+    strategy_name: old.strategy,
+    strategy_params: (old.strategy_state?.params as Record<string, unknown>) ?? {},
+    quantity: old.quantity,
+    autonomous: old.autonomous,
+    risk_caps: { ...DEFAULT_START.risk_caps },
+    order_type: (old.order_type ?? "LMT") as "MKT" | "LMT",
+    limit_offset_cents: old.limit_offset_cents ?? 10,
+    sell_anchor: (old.sell_anchor ?? "bid") as "bid" | "ask",
+    cancel_lmt_after_seconds: old.cancel_lmt_after_seconds ?? 3,
+    enable_depth: old.enable_depth ?? false,
+    enable_tape: old.enable_tape ?? false,
+    require_5m_macd: old.require_5m_macd ?? true,
+    dtd_context: { ...DEFAULT_DTD },
+  };
 }
 
 // ---------- subcomponents ----------
@@ -288,6 +476,390 @@ function Card({ title, children }: { title: string; children: React.ReactNode })
       </div>
       <div className="px-5 py-4">{children}</div>
     </div>
+  );
+}
+
+function PortfolioTopBar({
+  portfolio,
+  slots,
+  onResetKillSwitch,
+  busy,
+}: {
+  portfolio: EnginePortfolioStatus | undefined;
+  slots: EngineSlotsStatus | undefined;
+  onResetKillSwitch: () => void;
+  busy: boolean;
+}) {
+  const holder = portfolio?.holder ?? null;
+  const realised = portfolio?.realized_pnl_usd ?? 0;
+  const trades = portfolio?.trades_count ?? 0;
+  const maxLoss = portfolio?.caps?.max_daily_loss_usd ?? 0;
+  const maxTrades = portfolio?.caps?.max_total_trades_per_day ?? 0;
+  const killSwitchOn = portfolio?.kill_switch_on ?? false;
+  const lossPct = maxLoss > 0 ? Math.max(0, Math.min(100, (-realised / maxLoss) * 100)) : 0;
+  const realisedColor =
+    realised > 0
+      ? "text-emerald-700"
+      : realised < 0
+      ? "text-rose-700"
+      : "text-neutral-700";
+
+  return (
+    <div
+      className={
+        "rounded-xl border bg-white px-5 py-4 shadow-sm " +
+        (killSwitchOn
+          ? "border-rose-300 ring-1 ring-rose-200"
+          : "border-neutral-200")
+      }
+    >
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+        <div>
+          <div className="text-xs font-medium uppercase tracking-wider text-neutral-500">
+            Portfolio mutex
+          </div>
+          <div className="mt-1 text-sm">
+            {holder ? (
+              <span>
+                <span className="inline-block h-2 w-2 rounded-full bg-amber-500 align-middle" />{" "}
+                Held by{" "}
+                <span className="font-mono font-semibold text-amber-700">{holder}</span>
+              </span>
+            ) : (
+              <span>
+                <span className="inline-block h-2 w-2 rounded-full bg-emerald-500 align-middle" />{" "}
+                <span className="text-emerald-700">Idle (any engine can enter)</span>
+              </span>
+            )}
+          </div>
+        </div>
+
+        <div>
+          <div className="text-xs font-medium uppercase tracking-wider text-neutral-500">
+            Today's realised P&amp;L
+          </div>
+          <div className={"mt-1 text-sm font-semibold " + realisedColor}>
+            ${realised.toFixed(2)}{" "}
+            <span className="font-normal text-neutral-500">
+              of cap −${maxLoss.toFixed(2)}
+            </span>
+          </div>
+          <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-neutral-100">
+            <div
+              className={
+                "h-full transition-all " +
+                (lossPct > 80
+                  ? "bg-rose-500"
+                  : lossPct > 50
+                  ? "bg-amber-500"
+                  : "bg-emerald-500")
+              }
+              style={{ width: `${lossPct}%` }}
+            />
+          </div>
+        </div>
+
+        <div>
+          <div className="text-xs font-medium uppercase tracking-wider text-neutral-500">
+            Trades today
+          </div>
+          <div className="mt-1 text-sm font-semibold text-neutral-800">
+            {trades} / {maxTrades}
+          </div>
+          <div className="mt-1 text-xs text-neutral-500">
+            Slots: {slots?.active ?? 0} / {slots?.max ?? 4} engines
+          </div>
+        </div>
+
+        <div className="flex flex-col justify-between">
+          <div>
+            <div className="text-xs font-medium uppercase tracking-wider text-neutral-500">
+              Kill switch
+            </div>
+            <div className="mt-1 text-sm font-semibold">
+              {killSwitchOn ? (
+                <span className="text-rose-700">
+                  TRIPPED — no new entries
+                </span>
+              ) : (
+                <span className="text-neutral-700">Armed (off)</span>
+              )}
+            </div>
+          </div>
+          {killSwitchOn ? (
+            <button
+              type="button"
+              onClick={onResetKillSwitch}
+              disabled={busy}
+              className="mt-2 inline-flex h-8 items-center justify-center rounded-md border border-rose-300 bg-white px-3 text-xs font-medium text-rose-700 shadow-sm hover:bg-rose-50 disabled:opacity-50"
+            >
+              Reset kill switch
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EngineSidebar({
+  engines,
+  selectedSymbol,
+  portfolioHolder,
+  slotsActive,
+  slotsMax,
+  replaceModeSymbol,
+  addEngineMode,
+  busy,
+  onSelect,
+  onAdd,
+  onCancelAdd,
+  onStopSymbol,
+  onStopAll,
+  onStartReplace,
+  onCancelReplace,
+  onCommitReplace,
+}: {
+  engines: EngineStatus[];
+  selectedSymbol: string | null;
+  portfolioHolder: string | null;
+  slotsActive: number;
+  slotsMax: number;
+  replaceModeSymbol: string | null;
+  addEngineMode: boolean;
+  busy: boolean;
+  onSelect: (symbol: string) => void;
+  onAdd: () => void;
+  onCancelAdd: () => void;
+  onStopSymbol: (symbol: string) => void;
+  onStopAll: () => void;
+  onStartReplace: (symbol: string) => void;
+  onCancelReplace: () => void;
+  onCommitReplace: (oldSymbol: string, newSymbol: string) => void;
+}) {
+  const canAddMore = slotsActive < slotsMax;
+  return (
+    <div className="space-y-3">
+      <div className="rounded-xl border border-neutral-200 bg-white p-3 shadow-sm">
+        <div className="mb-2 flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-wider text-neutral-500">
+            Engines
+          </span>
+          <span className="text-xs text-neutral-500">
+            {slotsActive} / {slotsMax}
+          </span>
+        </div>
+        {addEngineMode ? (
+          <button
+            type="button"
+            onClick={onCancelAdd}
+            disabled={busy}
+            className="mb-2 inline-flex w-full items-center justify-center rounded-md border border-neutral-300 bg-neutral-50 px-3 py-2 text-sm font-medium text-neutral-700 shadow-sm hover:bg-neutral-100 disabled:opacity-50"
+          >
+            Cancel add
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={onAdd}
+            disabled={busy || !canAddMore}
+            title={canAddMore ? "Add a new engine" : "All slots full — stop one first"}
+            className="mb-2 inline-flex w-full items-center justify-center rounded-md border border-sky-300 bg-sky-50 px-3 py-2 text-sm font-medium text-sky-800 shadow-sm hover:bg-sky-100 disabled:opacity-50"
+          >
+            + Add engine
+          </button>
+        )}
+
+        <ul className="space-y-2">
+          {engines.length === 0 ? (
+            <li className="rounded-md border border-dashed border-neutral-200 px-3 py-4 text-center text-xs text-neutral-500">
+              No engines running. Click <span className="font-semibold">+ Add engine</span>{" "}
+              to start one.
+            </li>
+          ) : (
+            engines.map((eng) => (
+              <EngineSidebarCard
+                key={eng.symbol}
+                engine={eng}
+                selected={selectedSymbol === eng.symbol}
+                isMutexHolder={portfolioHolder === eng.symbol}
+                replaceMode={replaceModeSymbol === eng.symbol}
+                busy={busy}
+                onSelect={() => onSelect(eng.symbol)}
+                onStop={() => onStopSymbol(eng.symbol)}
+                onStartReplace={() => onStartReplace(eng.symbol)}
+                onCancelReplace={onCancelReplace}
+                onCommitReplace={(newSymbol) => onCommitReplace(eng.symbol, newSymbol)}
+              />
+            ))
+          )}
+        </ul>
+
+        {engines.length > 0 ? (
+          <button
+            type="button"
+            onClick={onStopAll}
+            disabled={busy}
+            className="mt-3 inline-flex w-full items-center justify-center rounded-md border border-neutral-300 bg-white px-3 py-2 text-xs font-medium text-neutral-700 shadow-sm hover:bg-neutral-50 disabled:opacity-50"
+          >
+            Stop all engines
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function EngineSidebarCard({
+  engine,
+  selected,
+  isMutexHolder,
+  replaceMode,
+  busy,
+  onSelect,
+  onStop,
+  onStartReplace,
+  onCancelReplace,
+  onCommitReplace,
+}: {
+  engine: EngineStatus;
+  selected: boolean;
+  isMutexHolder: boolean;
+  replaceMode: boolean;
+  busy: boolean;
+  onSelect: () => void;
+  onStop: () => void;
+  onStartReplace: () => void;
+  onCancelReplace: () => void;
+  onCommitReplace: (newSymbol: string) => void;
+}) {
+  const [replaceInput, setReplaceInput] = useState<string>("");
+  useEffect(() => {
+    if (replaceMode) setReplaceInput("");
+  }, [replaceMode]);
+
+  const macd1m =
+    engine.strategy_state?.macd_1m_hist ??
+    engine.strategy_state?.macd_histogram ??
+    null;
+  const pnl = engine.risk_state?.realized_pnl_usd ?? 0;
+  const inPosition = (engine.risk_state?.open_position_qty ?? 0) > 0;
+  const pnlColor =
+    pnl > 0 ? "text-emerald-700" : pnl < 0 ? "text-rose-700" : "text-neutral-700";
+
+  return (
+    <li
+      className={
+        "rounded-md border px-3 py-2 transition-colors " +
+        (selected
+          ? "border-sky-400 bg-sky-50 ring-1 ring-sky-200"
+          : "border-neutral-200 bg-white hover:bg-neutral-50")
+      }
+    >
+      <button type="button" onClick={onSelect} className="block w-full text-left">
+        <div className="flex items-center justify-between gap-2">
+          <span className="font-mono text-sm font-semibold text-neutral-900">
+            {engine.symbol}
+          </span>
+          <div className="flex items-center gap-1">
+            {isMutexHolder ? (
+              <span
+                title="This engine currently holds the portfolio execution mutex"
+                className="inline-flex items-center rounded-full bg-amber-100 px-1.5 text-[10px] font-semibold uppercase tracking-wider text-amber-700 ring-1 ring-amber-200"
+              >
+                Holds
+              </span>
+            ) : null}
+            {inPosition ? (
+              <span className="inline-flex items-center rounded-full bg-sky-100 px-1.5 text-[10px] font-semibold uppercase tracking-wider text-sky-700 ring-1 ring-sky-200">
+                Pos
+              </span>
+            ) : null}
+            {engine.has_pending_approval ? (
+              <span className="inline-flex items-center rounded-full bg-amber-100 px-1.5 text-[10px] font-semibold uppercase tracking-wider text-amber-700 ring-1 ring-amber-200">
+                Approval
+              </span>
+            ) : null}
+          </div>
+        </div>
+        <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs">
+          <div className="text-neutral-500">
+            MACD1m{" "}
+            <span className="font-mono text-neutral-800">
+              {macd1m != null ? macd1m.toFixed(3) : "—"}
+            </span>
+          </div>
+          <div className={"font-mono " + pnlColor}>
+            ${pnl.toFixed(2)}
+          </div>
+          <div className="col-span-2 truncate text-neutral-500">
+            {engine.strategy} • {engine.autonomous ? "auto" : "manual"} • qty {engine.quantity}
+          </div>
+        </div>
+      </button>
+
+      {replaceMode ? (
+        <div className="mt-2 space-y-1.5">
+          <input
+            type="text"
+            autoFocus
+            placeholder="New symbol…"
+            value={replaceInput}
+            onChange={(e) => setReplaceInput(e.target.value.toUpperCase())}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && replaceInput.trim().length > 0) {
+                onCommitReplace(replaceInput.trim());
+              } else if (e.key === "Escape") {
+                onCancelReplace();
+              }
+            }}
+            className="block w-full rounded-md border border-neutral-300 px-2 py-1 font-mono text-xs uppercase shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+          />
+          <div className="flex gap-1">
+            <button
+              type="button"
+              onClick={() => onCommitReplace(replaceInput.trim())}
+              disabled={busy || replaceInput.trim().length === 0}
+              className="flex-1 rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs font-medium text-sky-800 shadow-sm hover:bg-sky-100 disabled:opacity-50"
+            >
+              Replace
+            </button>
+            <button
+              type="button"
+              onClick={onCancelReplace}
+              disabled={busy}
+              className="rounded-md border border-neutral-300 bg-white px-2 py-1 text-xs font-medium text-neutral-700 shadow-sm hover:bg-neutral-50 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="mt-2 flex gap-1">
+          <button
+            type="button"
+            onClick={onStartReplace}
+            disabled={busy || isMutexHolder}
+            title={
+              isMutexHolder
+                ? "Cannot drop the engine holding the mutex — wait for exit or stop it first"
+                : "Stop this engine and start a new one on a different symbol"
+            }
+            className="flex-1 rounded-md border border-neutral-300 bg-white px-2 py-1 text-xs font-medium text-neutral-700 shadow-sm hover:bg-neutral-50 disabled:opacity-50"
+          >
+            Drop &amp; replace
+          </button>
+          <button
+            type="button"
+            onClick={onStop}
+            disabled={busy}
+            className="rounded-md border border-rose-300 bg-white px-2 py-1 text-xs font-medium text-rose-700 shadow-sm hover:bg-rose-50 disabled:opacity-50"
+          >
+            Stop
+          </button>
+        </div>
+      )}
+    </li>
   );
 }
 
