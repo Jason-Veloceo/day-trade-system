@@ -9,12 +9,22 @@ strategy on small-cap US equities, with forex as a 24-hour smoke-test rail.
 > `PAPER_TRADING_ONLY=true`); the system refuses to submit orders outside
 > paper.
 
-## Current state — June 24, 2026
+## Current state — June 26, 2026
 
-**v1.2 semi-automated FirstPullback engine** is the active surface. Visit
-`/engine`. You arm a single symbol (the human picks it — currently no
-auto-promotion from DTD), the engine watches the gate stack, and submits
-paper orders via IBKR TWS.
+**v1.3 multi-engine dashboard** is the active surface. Visit `/engine`.
+You arm up to 4 symbols simultaneously, each runs in its own
+`TradingEngine` with independent bars / indicators / gates / exits, and
+a portfolio-wide execution mutex (`PortfolioRiskGate`) guarantees only
+**one position is open at a time across the entire dashboard**. The
+other engines keep evaluating gates and journal
+`entry_blocked_by_portfolio_mutex` events whenever they would have
+fired — giving you the calibration data ("what setups did I miss while
+holding something else") for the multi-engine workflow.
+
+**First end-to-end paper trade landed Fri 26 Jun** on ILLR (run #25):
+BUY 20 @ $5.15 → SELL 20 @ $5.29 = **+$2.80 (+2.7%) in one minute**.
+Full pipeline validated: mutex acquire → marketable LMT submit → fill →
+exit-framework evaluation → mutex release.
 
 **🎯 Major unblock on Wed 24 Jun**: full L1 + L2 (NASDAQ TotalView) + T&S
 + historical + real-time bars are now **all flowing via the API on paper
@@ -67,6 +77,57 @@ engine yet.
 
 ### Recently landed
 
+- **v1.3 multi-engine substrate** (Fri 26 Jun, commits `e8adfce` →
+  `9c907c4`):
+  - `EngineRegistry` replaces the `EngineRunner` singleton — up to
+    `max_concurrent_engines` (default 4) `TradingEngine` instances
+    run concurrently, each fully independent (own BarFeed,
+    strategy, gate stack, exits).
+  - `PortfolioRiskGate` (new) holds a portfolio-wide execution
+    mutex with `asyncio.Lock`-serialised `try_acquire_for_entry` /
+    `release`. While the mutex is held by one engine, others
+    journal `entry_blocked_by_portfolio_mutex` instead of
+    submitting. Released on position-flat (after the exit fill
+    confirms `position.qty == 0`).
+  - Portfolio-level risk caps separate from per-engine caps:
+    `max_daily_loss_usd` ($200 default), `max_concurrent_engines`
+    (4), `max_total_trades_per_day` (10). Daily kill switch trips
+    on loss limit; rolls at UTC midnight; `POST
+    /engine/portfolio/reset_kill_switch` for manual reset.
+  - API: `POST /engine/start` allows up to 4; `POST
+    /engine/stop?symbol=X`; `POST /engine/stop_all`; `POST
+    /engine/approve?run_id=…`; `GET /engine/status` returns
+    `{engines: [...], portfolio: {...}, slots: {...}}`; `GET
+    /engine/portfolio` for just the mutex state.
+  - Multi-card dashboard UI: sidebar of active engines + main
+    detail panel + portfolio top bar (mutex holder, daily P&L,
+    trade count, slots used, kill switch). "+ Add engine"
+    button to spin up new slots; "Drop & replace" on each card to
+    swap the symbol inline. Per-engine "Non-tradable" banner when
+    mutex is held elsewhere.
+  - 31 new tests covering registry lifecycle, portfolio risk
+    mutex, mutex+engine integration (acquire-before-submit,
+    release-on-flat, release-on-stop, denied-by-kill-switch).
+- **Bug fixes Fri 26 Jun PM (committed `3ab93a0`, `80afc0f`,
+  `9c907c4`):**
+  - `+ Add engine` button no longer flickers when the form's
+    default symbol matches an already-running engine.
+  - Engine in-memory `status` was permanently stuck on `"starting"`
+    (dead `_running_task` field, never assigned anywhere) — now
+    derived from `self.feed is not None`.
+  - Live event log's `indicator` summary always rendered `5m=—
+    vwap=—`, even on `macd_crossover_long` engines (a 1m-MACD-only
+    strategy whose snapshot intentionally omits those fields).
+    Looked like 5m MACD was broken / unwarmed when it wasn't even
+    being computed. Now branches on `strategy.name`:
+    macd_crossover_long renders `1m=<value>  (1m MACD only)`.
+  - Right-panel `StrategyStatePanel` had the same issue: misleading
+    `—` tiles for macd_crossover_long. Now shows 1m hist + MACD
+    line + signal line for that strategy.
+  - Live event log was missing filter pills for `indicator`,
+    `ready_for_approval`, and `order_submit` — those events were
+    hidden inside "all" only. Added with friendly labels
+    (`approval`, `order`).
 - **2-day bootstrap + `require_5m_macd` toggle** (Wed 24 Jun PM): the
   engine now requests `durationStr="2 D"` of 1m historical bars on
   Arm (previously 4 hours), so 5m MACD warms instantly via
@@ -146,13 +207,76 @@ to spec:
   TotalView depth would require `isSmartDepth=False` with explicit
   `exchange="ISLAND"` routing, but is not required for our use case.
 
+### Fri 26 Jun PM session — v1.3 multi-engine shipped + first paper trade
+
+Pure paper-trading session during US RTH. Four-day multi-engine slice
+(Phase 1) shipped end-to-end across `e8adfce` → `9c907c4`. Listed under
+"Recently landed" above; this section is the live-testing narrative
+that surfaced the open follow-ups.
+
+**Multi-engine live test (4 concurrent engines on US equities):**
+SDOT, CANE, ILLR, REA were armed simultaneously on
+`first_pullback_long`. All 4 bootstrapped 2 days of historical bars
+successfully and indicators were warm from the first live bar (1m
+MACD, 5m MACD, VWAP, HoD all populated). Confirmed via
+`GET /engine/status`. The mutex stayed idle (`holder=None`) the entire
+time the user watched — gate stack consistently refused all 4
+candidates on a mix of:
+
+- "5m MACD histogram is falling"
+- "backside: 1m MACD has already crossed down today"
+- "trigger (pullback_break): current bar is not green"
+
+**ILLR's `pullback_break` trigger ACTUALLY FIRED** ("green bar broke
+last-red-pullback high 4.86, current high 5.06") but the **backside
+veto stopped the entry** because 5m MACD was negative and falling.
+This is the second time on US equities the engine has shown discipline
+in refusing a fired trigger on broader-trend grounds. Working as
+designed.
+
+**First end-to-end paper trade (ILLR run #25):** to validate the
+execution pipeline without waiting for a pullback_break setup, three
+slots were re-armed on the looser `macd_crossover_long` strategy with
+`autonomous=true`:
+
+| Time | Event | Detail |
+|---|---|---|
+| 14:33:00 | `signal: enter_long` | 1m MACD histogram crossed positive (−0.002 → +0.001) |
+| 14:33:00 | `decision: auto_execute_enter` | Autonomous mode bypasses approval |
+| 14:33:00 | `order_submit` | BUY 20 LMT @ 5.17 (`ask + 10c`) |
+| 14:33:09 | `fill` | BUY 20 @ **5.15** (1.5c price improvement) |
+| 14:34:00 | `decision: exit_trigger=second_target` | bar high 5.36 ≥ 2R target 5.2683 |
+| 14:34:00 | `order_submit` | SELL 20 LMT (`bid - 10c`, `exit_trigger=second_target`) |
+| 14:34:05 | `fill` | SELL 20 @ **5.29** (2.99c price improvement) |
+
+Net: **+$2.80 (+2.7%) on $103 position in 66 seconds**, mutex cleanly
+released, portfolio realized P&L updated. The full pipeline works.
+
+**Design mismatch surfaced — exit framework is NOT Ross-style.** The
+trade closed on the `SECOND_TARGET` trigger (fixed 2R take-profit),
+firing the moment `bar.high >= entry + 2*R`. MACD was still strongly
+positive at the time. Ross Cameron does NOT set price targets — he
+reads L2 (ask wall formation, level absorption) and tape (buy/sell
+flow imbalance, speed decay) in real time to find resistance and exit
+dynamically. Our existing `L2_DISTRESS` and `TAPE_FLIP` triggers are
+defensive (fire when the move is failing), not profit-taking. See the
+**"Ross-style exit redesign"** item in Open follow-ups for the
+proposed Saturday-morning work.
+
+**Stop-loss provenance (worth knowing):** `macd_crossover_long` is a
+"legacy" strategy and does not expose `suggest_stop_price`, so the
+engine fell back to `entry * 0.99` in `_handle_enter`. That set the
+stop at 5.1134 and the 2R target at 5.2683. For the redesigned exit
+framework we should also revisit the legacy 1% fallback — Ross stops
+are structural (last swing low / VWAP / wall), not percentage-based.
+
 ### Open follow-ups (pick up here)
 
-Last session ended Wed 24 Jun ~21:20 Perth (Wed pre-market US close-out).
-Servers stopped, repo pushed. **The IBKR data block from Mon 22 Jun
-is fully resolved** and the engine has now been validated end-to-end
-on two live US small-caps (LHSW, FRTT) with the gate stack correctly
-refusing both on the backside veto.
+Last session ended Fri 26 Jun ~22:50 Perth (Fri US RTH).
+Servers stopped, repo pushed. **v1.3 multi-engine shipped + first
+end-to-end paper trade executed** (ILLR run #25, +$2.80 in 66s). The
+session surfaced an important design mismatch in the exit framework —
+see the "next big slice" below.
 
 Account routing: still using **original paper `DUM733674`** — once
 the Trust funding cleared, entitlements propagated user-wide and
@@ -166,111 +290,107 @@ History (kept for context):
 | U21585867 Individual | None | `DUM733674` (primary) | N/A |
 | U23755393 Trust | ✅ ~AUD 47/mo (NASDAQ L1+L2, NYSE A/B, Snapshot) | `DUQ861843` (username `flingwing007`, spare) | AUD 4,000 funded |
 
-**THE NEXT BIG SLICE — Multi-engine concurrent monitoring with
-execution mutex.**
+**MULTI-ENGINE SLICE — ✅ DONE (Fri 26 Jun).** `EngineRegistry`,
+`PortfolioRiskGate`, multi-card dashboard, "Drop & replace", and
+portfolio-level risk caps all shipped. See "Recently landed". The
+five design questions (non-tradable semantics, mutex release timing,
+mutex leak recovery, portfolio risk caps, UI layout) were resolved
+in [`docs/multi_engine_design.md`](docs/multi_engine_design.md)
+before coding.
 
-Ross typically has 3-5 movers alerting on his scanners simultaneously,
-and the current "one engine at a time" runner singleton forces the
-user to manually rotate between candidates — which costs attention
-and risks missing the actual setup. The user's stated requirement
-(Wed 24 Jun PM):
+**THE NEXT BIG SLICE — Ross-style dynamic exit framework redesign.**
 
-> "I want to monitor up to 4 stocks at once. When one triggers and
->  I take the trade, the others become non-tradable until the
->  position is exited."
+Surfaced by the ILLR run #25 trade. The exit closed on a fixed 2R
+take-profit (`SECOND_TARGET`), not on any L2/tape signal — MACD was
+still strongly positive at exit. **Ross does NOT set price targets.**
+He reads the order book and tape in real time to find resistance and
+sell into it. Our current `exits.py` has the wrong primitives at the
+top of the priority chain (fixed-R targets fire before any dynamic
+trigger gets a chance).
 
-This is **multi-watch, mutex-execute** semantics. Sketch:
+What we have today (`backend/src/day_trade/engine/exits.py`):
 
-```
-EngineRegistry (replaces EngineRunner singleton)
-  dict[symbol, TradingEngine]
-  start(symbol, ...) -> add engine, no global lock
-  stop(symbol) -> stop specific engine
-  active() -> list of all running engines
-       |
-       v
-TradingEngine x N (one per symbol, fully independent)
-  - own BarFeed, indicators, gate stack, exits
-  - subscribes to its own L2/T&S/quote
-       |
-       v on entry signal
-PortfolioRiskGate (NEW)
-  - try_acquire_for_entry(run_id) -> bool, atomic
-  - release(run_id)
-  - holds the "any engine in a position?" mutex
-  - blocks other engines' entries while one holds a position
-  - releases on position-flat (any exit reason)
-```
+| # | Trigger | Type | Issue |
+|---|---|---|---|
+| 1 | `HARD_STOP` | Price | OK — keep |
+| 2 | `SECOND_TARGET` | Fixed 2R | **Wrong primitive — fires before dynamic exits** |
+| 3 | `FIRST_TARGET` | Fixed 1R partial | **Wrong primitive — same** |
+| 4 | `MACD_FLIP` | Indicator | OK as one of many exits |
+| 5 | `VWAP_LOSS` | Indicator | OK |
+| 6 | `L2_DISTRESS` | L2 | Defensive only — fires when bid imbalance or wall is bad |
+| 7 | `TAPE_FLIP` | Tape | Defensive only — fires when buys < 40% |
+| 8 | `TIME_STOP` | Time | OK |
 
-When the mutex blocks an entry, the engine still journals
-`blocked_by_portfolio_mutex` with the gate state — so the user has
-a paper trail of "this would have fired too". Cross-engine risk
-caps (e.g. portfolio-wide `max_daily_loss_usd`) consult the same
-shared state.
+What's missing:
 
-Scope estimate: **3-4 days of focused work.**
+- **L2 PROFIT-TAKING exit** (new) — detect ask wall forming /
+  thickening in front of price *while we're in profit*. Different
+  from L2_DISTRESS (which is about the move actively failing). Look
+  for resting size growing within ~20-30 bps of mid that wasn't
+  there N bars ago, AND we're +N cents above entry.
+- **"First red sell" rule** (new) — Ross's classic: once we're in
+  profit (e.g. +0.5R), exit on the close of the first red 1m bar.
+  Locks in trend trades cleanly without staring at L2.
+- **Structural stop, not %-based** — `_handle_enter` falls back to
+  `entry * 0.99` for legacy strategies (incl. macd_crossover_long
+  which is the test bench). Should use last swing low / VWAP / next
+  visible bid instead. The 1% fallback is what set R=5c on ILLR,
+  making 2R = 10c — far too tight for any real momentum read.
 
-| Layer | Change | Effort |
-|---|---|---|
-| `engine/runner.py` | `EngineRunner` → `EngineRegistry`; methods take a `symbol` parameter; remove the `EngineBusyError` constraint | ~0.5 day |
-| NEW `engine/portfolio_risk.py` | `PortfolioRiskGate` with asyncio.Lock-serialised try-acquire/release; mutex leakage recovery via IBKR position reconciliation | ~0.5 day |
-| `engine/engine.py` | Gate every order submission via `PortfolioRiskGate.try_acquire`; release on position-flat; audit blocked attempts | ~0.5 day |
-| `engine/ibkr_client.py` | No change — already supports multiple concurrent subscriptions on one connection. Keep single `clientId` for now (revisit if we ever need per-engine isolation) | 0 |
-| `api/engine.py` | `/engine/start` allows multiple; `/engine/stop?symbol=X`; `/engine/status` returns `{engines: [...]}` ; new `/engine/portfolio` for mutex state | ~0.5 day |
-| `frontend/src/app/engine/page.tsx` | Multi-card dashboard; "+ Add Engine" button; visual lockout indicator when mutex is held by another engine | ~1-1.5 days |
-| Testing + audit | Mutex acquire/release lifecycle across partial fills, cancellations, distress exits; orphan-mutex recovery on backend restart | ~0.5 day |
+Open design questions to resolve BEFORE coding:
 
-Key open design questions to resolve BEFORE coding:
+1. **Disable 1R/2R outright, or keep them off-by-default and let
+   strategies opt in?** Recommendation: off by default, opt-in via
+   `ExitConfig.enable_first_target=False, enable_second_target=False`.
+   The data structures stay (cheap), but the default profile becomes
+   Ross-style.
+2. **Where does the L2-profit-take live — `exits.py` or a new
+   `exits_dynamic.py`?** Lean toward extending `exits.py` to keep
+   first-wins arbitration in one place.
+3. **What constitutes "ask wall forming"?** Need to define
+   quantitatively — current `ask_wall_size_multiple=5.0` and
+   `ask_wall_distance_bps=20.0` are tuned for distress, not
+   absorption. Likely need rolling N-bar baseline of ask size at
+   wall-level to detect *growth*.
+4. **Structural stop for legacy strategies.** Either (a) every
+   strategy must implement `suggest_stop_price` (clean but breaks
+   `macd_crossover_long` until updated), or (b) the engine computes
+   a structural stop from recent bars (last swing low) when the
+   strategy doesn't provide one.
+5. **How do we test L2-driven exits in CI?** No live IBKR depth in
+   tests. Need a `FakeOrderBook` fixture that can be scripted to
+   produce wall-formation / wall-absorption / wall-pull sequences.
 
-1. **What is "non-tradable" exactly?** Suggested: engine still
-   evaluates gates and emits `entry_signal` events to the audit log,
-   but on the order-submission step it sees the mutex held and
-   journals `blocked_by_portfolio_mutex` without submitting. Continues
-   monitoring normally. Alternative: full freeze (no gate evaluation
-   either) — saves CPU but loses observability.
-2. **Mutex release timing.** Release on `position.qty == 0` after a
-   confirmed fill of the exit order? Or on the exit-trigger firing
-   (before the exit-order fills)? The former is safer (no double-
-   entry risk). The latter is faster but needs careful handling of
-   partial-fill scenarios.
-3. **Mutex leak recovery.** If the engine that held the mutex
-   crashes mid-trade, the mutex stays held. On `EngineRegistry`
-   restart, query IBKR for actual account positions and reconcile —
-   if no open positions exist, release the mutex; if positions
-   exist, identify which engine owns them and re-attach.
-4. **Per-engine vs portfolio risk caps.** Today `max_daily_loss_usd`
-   is per-engine. With multiple engines, almost certainly we want
-   **portfolio-level** — total daily loss across all engines combined.
-   Same for `max_position_value_usd` and trade-count caps. New
-   `PortfolioRiskCaps` config, separate from per-engine `RiskCaps`.
-5. **UI layout.** Vertical stack of 4 cards? Grid? Collapsible
-   cards? My instinct: 2x2 grid with expand-to-inspect modal.
+Scope estimate: **2-3 days of focused work**, plus 1 day on a
+structural-stop refactor if we go that route.
 
-**Interim option (~2 hours) being considered**: a "Swap Symbol"
-button on the single-engine dashboard that atomically stops the
-current engine and arms a new one in a single click. Lower
-complexity, lets the user rotate through Ross-scanner candidates
-faster. NOT multi-engine — still one at a time. Decide tomorrow.
+**Other follow-ups (still open, lower priority than the exit redesign):**
 
-**Other follow-ups (still open, lower priority than multi-engine):**
-
-- **Plan the L2/T&S feature layer (Bookmap-style)** — the infrastructure
-  is open, the engine has scaffolded `orderbook.py` + `features.py`,
-  and we need to validate against Ross's actual decision-making
-  patterns before writing code. Plan first; code after. The smart-
-  aggregated depth (IEX + top-of-book from ~14 exchanges) we get
-  via `isSmartDepth=True` is sufficient for resting wall, aggressor
-  imbalance, absorption, and sweep detection.
+- **Phase 2 — DTD scanner auto-feed.** Revive the on-hold Playwright
+  DTD observer, route scanner alerts to auto-populate free engine
+  slots, define slot-eviction policy (stale by how many bars without
+  momentum?), respect manual-drop precedence. ~2-3 days.
+- **Snapshot-on-arm evaluation.** When an engine is armed mid-move,
+  immediately replay the current partial bar's state and ask "would
+  this fire if I treated the partial as closed?" — gives a chance to
+  catch a move already in progress instead of waiting for the next
+  bar close. ~1 day. Becomes more important once DTD auto-feed lands
+  (alerts arrive mid-bar, and the next bar close could be 50 seconds
+  away).
+- **Plan the L2/T&S feature layer (Bookmap-style)** — partially
+  unblocked by the exit redesign above (the L2 profit-take primitive
+  will exercise much of this). The engine has scaffolded
+  `orderbook.py` + `features.py`; we need to validate against Ross's
+  actual decision-making patterns before writing code. Plan first;
+  code after.
 - **Manual force-entry button** ("Buy Now") for cases where the user
   has personal conviction on a setup that the engine's trigger
   hasn't fired on (e.g. user joining a hot mover late). Submits the
   configured LMT@ask+offset order with all risk caps applied; engine
-  then manages the position with normal exit triggers. Discussed
-  Wed 24 Jun PM, parked for post-multi-engine.
+  then manages the position with normal exit triggers.
 - **10-second chart visualization** — aggregate IBKR 5s real-time
   bars into 10s candles for fast tape-reading-style chart view.
   UX upgrade only; strategy decisions still 1m bar-close driven.
-  Parked for post-multi-engine.
 - **Live forming candle not visibly updating in browser** despite
   backend code in place (`9083618`). Backend publishes
   `engine.bar_tick` every 5s; frontend doesn't appear to redraw.
@@ -493,8 +613,9 @@ backend/
       models.py               # EngineRun, EngineEvent, BarAggregate, ...
       session.py              # async_sessionmaker + session_scope
       ...
-    engine/                   # >>> the v1.2 trading engine <<<
-      runner.py               # process-wide singleton; one active engine
+    engine/                   # >>> the v1.3 trading engine <<<
+      registry.py             # EngineRegistry — up to 4 concurrent engines
+      portfolio_risk.py       # PortfolioRiskGate — execution mutex + daily caps
       engine.py               # bar loop, gate stack, exit arbitration
       strategies/
         base.py
@@ -558,9 +679,16 @@ scripts/
 
 ### Engine
 
-- **Single active engine, process-wide** ([`engine/runner.py`](backend/src/day_trade/engine/runner.py)).
-  Arming a new symbol while another is running returns 409. Auto-rearms
-  after each exit until you Stop.
+- **Up to 4 concurrent engines, single-position execution mutex**
+  ([`engine/registry.py`](backend/src/day_trade/engine/registry.py) +
+  [`engine/portfolio_risk.py`](backend/src/day_trade/engine/portfolio_risk.py)).
+  Each engine runs independently (own BarFeed, indicators, gate
+  stack, exits). When one engine acquires the mutex for an entry,
+  the others continue evaluating gates but journal
+  `entry_blocked_by_portfolio_mutex` instead of submitting orders.
+  The mutex releases when the holder's position goes flat. Portfolio
+  daily caps (`max_daily_loss_usd`, `max_total_trades_per_day`) trip
+  a hard kill switch that resets at UTC midnight.
 - **Configurable entry trigger** ([`engine/triggers.py`](backend/src/day_trade/engine/triggers.py)).
   `pullback_break` is the Ross-style structural pattern ("first 1m
   green candle whose high breaks the last red of a 1-3 bar pullback");
