@@ -53,20 +53,100 @@ class _FakeJournal:
         return [p for k, p in self.records if k == kind]
 
 
+class _FakeEvent:
+    """Drop-in replacement for an ib_async event that supports `+=` to
+    register subscribers. We don't actually fire from these in tests —
+    the integration tests drive `_on_entry_fill` / `_on_entry_status`
+    directly via the helpers below, which is the same path ib_async
+    would take in production."""
+
+    def __init__(self) -> None:
+        self._subs: list[Any] = []
+
+    def __iadd__(self, fn: Any) -> _FakeEvent:
+        self._subs.append(fn)
+        return self
+
+
+@dataclass
+class _FakeOrder:
+    orderId: int = 99
+
+
+@dataclass
+class _FakeOrderStatus:
+    status: str = "Submitted"
+    filled: float = 0.0
+    remaining: float = 0.0
+    avgFillPrice: float = 0.0
+
+
+class _FakeTrade:
+    """Stand-in for ib_async.Trade. Has the `fillEvent` / `statusEvent`
+    surfaces the engine subscribes to, plus mutable `orderStatus` so
+    tests can simulate fills and cancellations."""
+
+    def __init__(self) -> None:
+        self.order = _FakeOrder()
+        self.orderStatus = _FakeOrderStatus()
+        self.fillEvent = _FakeEvent()
+        self.statusEvent = _FakeEvent()
+
+
 class _FakeExecutor:
     """Stub executor with configurable return value. By default returns
-    a sentinel non-None value so the engine treats the submit as
-    successful. Set `return_none=True` to simulate a submit failure."""
+    a `_FakeTrade` so the engine treats the submit as successful and
+    can wire its fillEvent / statusEvent subscribers. Set
+    `return_none=True` to simulate a submit failure."""
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.return_none = False
+        self.last_trade: _FakeTrade | None = None
 
-    async def execute(self, **kwargs: Any) -> object | None:
+    async def execute(self, **kwargs: Any) -> _FakeTrade | None:
         self.calls.append(kwargs)
         if self.return_none:
             return None
-        return object()
+        trade = _FakeTrade()
+        self.last_trade = trade
+        return trade
+
+
+async def _simulate_full_fill(
+    engine: TradingEngine, *, price: float, qty: int
+) -> None:
+    """Drive the engine's pending-entry → in-position transition by hand
+    in tests. In production this happens automatically when ib_async
+    fires fillEvent + statusEvent on the IBKR Trade, but the test
+    harness doesn't go through the broker, so we mutate the FakeTrade
+    and call the engine's handlers ourselves.
+
+    Mirrors the v1.2 "position open immediately after _handle_enter"
+    semantics in tests that aren't specifically exercising the new
+    fill-confirmation gate.
+    """
+    pe = engine._pending_entry
+    assert pe is not None, "no pending entry to fill"
+    trade = pe.trade
+    trade.orderStatus.status = "Filled"
+    trade.orderStatus.filled = float(qty)
+    trade.orderStatus.avgFillPrice = float(price)
+    await engine._on_entry_fill(trade)
+    await engine._on_entry_status(trade)
+
+
+async def _simulate_cancel_no_fill(engine: TradingEngine) -> None:
+    """Drive the cancellation path: BUY came back Cancelled with 0 fills,
+    so the engine rolls back to no-position state and releases the mutex.
+    """
+    pe = engine._pending_entry
+    assert pe is not None, "no pending entry to cancel"
+    trade = pe.trade
+    trade.orderStatus.status = "Cancelled"
+    trade.orderStatus.filled = 0.0
+    trade.orderStatus.avgFillPrice = 0.0
+    await engine._on_entry_status(trade)
 
 
 class _FakeStrategy:
@@ -151,6 +231,7 @@ def _build_engine(
     engine._holds_portfolio_mutex = False
 
     engine._pending = None
+    engine._pending_entry = None
     engine._stop_event = asyncio.Event()
     engine._running_task = None
 
@@ -280,8 +361,11 @@ async def test_handle_enter_releases_mutex_on_submit_failure() -> None:
 @pytest.mark.asyncio
 async def test_handle_exit_decision_releases_mutex_on_full_close() -> None:
     engine, _, executor, prg, _ = _build_engine()
-    # Enter first
+    # Enter first + confirm fill (v1.3 fill-gated entry; without the
+    # simulated fill the engine would still be in pending-entry state
+    # and have no position to exit).
     await engine._handle_enter(_bar_at(close=100.0), _signal_at(price=100.0), snap=None)
+    await _simulate_full_fill(engine, price=100.0, qty=10)
     assert engine._holds_portfolio_mutex is True
 
     # Now drive a full-close exit decision
@@ -305,6 +389,7 @@ async def test_handle_exit_decision_releases_mutex_on_full_close() -> None:
 async def test_handle_exit_decision_partial_close_keeps_mutex() -> None:
     engine, _, executor, prg, _ = _build_engine()
     await engine._handle_enter(_bar_at(close=100.0), _signal_at(price=100.0), snap=None)
+    await _simulate_full_fill(engine, price=100.0, qty=10)
     assert engine._holds_portfolio_mutex is True
 
     # 50% partial close — the engine code does `qty = max(int(held * 0.5), 0)`
@@ -331,6 +416,7 @@ async def test_handle_exit_decision_partial_close_keeps_mutex() -> None:
 async def test_handle_exit_signal_releases_mutex_on_full_close() -> None:
     engine, _, executor, prg, _ = _build_engine()
     await engine._handle_enter(_bar_at(close=100.0), _signal_at(price=100.0), snap=None)
+    await _simulate_full_fill(engine, price=100.0, qty=10)
     assert engine._holds_portfolio_mutex is True
 
     exit_signal = Signal(
@@ -354,6 +440,7 @@ async def test_handle_exit_signal_releases_mutex_on_full_close() -> None:
 async def test_stop_releases_mutex_when_held() -> None:
     engine, journal, _, prg, _ = _build_engine()
     await engine._handle_enter(_bar_at(close=100.0), _signal_at(price=100.0), snap=None)
+    await _simulate_full_fill(engine, price=100.0, qty=10)
     assert engine._holds_portfolio_mutex is True
     assert prg.holder() == "SKYQ"
 
@@ -372,6 +459,74 @@ async def test_stop_releases_mutex_when_held() -> None:
     warnings = journal.payloads_for("warning")
     assert len(warnings) == 1
     assert warnings[0]["where"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_entry_cancelled_without_fill_does_not_open_position() -> None:
+    """Regression: HKIT incident Fri 26 Jun PM.
+
+    Before this fix, the engine opened the exit framework and marked
+    `risk.state.open_position_qty = quantity` at order SUBMIT time. If
+    the BUY then cancelled with zero fills (wide-spread micro-cap), the
+    engine was left with a phantom position — next bar's hard_stop
+    exit fired and submitted a SELL to close something that never
+    existed.
+
+    Now the engine waits for IBKR to confirm a fill before opening
+    position state. If the BUY cancels with zero fills, everything
+    rolls back cleanly.
+    """
+    engine, journal, executor, prg, strategy = _build_engine()
+
+    await engine._handle_enter(_bar_at(close=100.0), _signal_at(price=100.0), snap=None)
+    # Post-submit state: mutex acquired, strategy latched, but NO
+    # position open yet, NO exits armed.
+    assert engine._holds_portfolio_mutex is True
+    assert prg.holder() == "SKYQ"
+    assert engine._pending_entry is not None
+    assert engine.risk.state.open_position_qty == 0
+    assert engine._entry_price is None
+    assert engine.exits.state is None  # exit framework not armed
+
+    # Simulate IBKR cancelling the order with 0 fills (cancel-on-timeout).
+    await _simulate_cancel_no_fill(engine)
+
+    # All entry-side state rolled back; mutex released.
+    assert engine._pending_entry is None
+    assert engine._holds_portfolio_mutex is False
+    assert prg.holder() is None
+    assert engine.risk.state.open_position_qty == 0
+    assert engine._entry_price is None
+    assert engine.exits.state is None
+    # Strategy unlatched so it can try again on the next signal
+    assert strategy.in_position is False
+    # Journaled for the audit trail
+    cancels = journal.payloads_for("entry_cancelled_without_fill")
+    assert len(cancels) == 1
+
+
+@pytest.mark.asyncio
+async def test_entry_first_fill_opens_exits_with_actual_fill_price() -> None:
+    """Once the BUY confirms its first fill, the engine promotes
+    pending-entry → in-position. The entry price recorded for the exit
+    framework is the ACTUAL avg fill price from IBKR, not the signal
+    price — important because the executor adds an offset to the signal
+    price and the fill can vary further from the limit due to spread."""
+    engine, _, _, _, _ = _build_engine()
+
+    await engine._handle_enter(_bar_at(close=100.0), _signal_at(price=100.0), snap=None)
+    # Pre-fill: no position, no exits
+    assert engine.risk.state.open_position_qty == 0
+    assert engine.exits.state is None
+
+    # IBKR fills at 100.05 (slightly above signal price of 100.0)
+    await _simulate_full_fill(engine, price=100.05, qty=10)
+
+    # Position recorded at FILL price, not signal price
+    assert engine._entry_price == 100.05
+    assert engine.risk.state.open_position_qty == 10
+    assert engine.exits.state is not None
+    assert engine.exits.state.entry_price == 100.05
 
 
 @pytest.mark.asyncio

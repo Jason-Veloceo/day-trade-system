@@ -128,6 +128,27 @@ engine yet.
     `ready_for_approval`, and `order_submit` — those events were
     hidden inside "all" only. Added with friendly labels
     (`approval`, `order`).
+  - **Phantom-position bug** (HKIT incident, Fri 26 Jun ~22:57):
+    the engine optimistically called `risk.record_open(qty)` and
+    `exits.open(...)` at order-SUBMIT time, BEFORE waiting for the
+    BUY to actually fill. On a wide-spread micro-cap (HKIT,
+    bid 0.18 / ask 0.36), the BUY cancel-on-timeout fired with 0
+    fills — but the engine still thought it owned 20 shares.
+    Next bar's `low` dipped below the % stop, `hard_stop` exit
+    fired, and the engine submitted a SELL to close a position
+    that never existed. Now `_handle_enter` only submits + latches
+    the strategy; new `_on_entry_fill` / `_on_entry_status`
+    callbacks promote pending → in-position on the first IBKR fill
+    (using the actual avg fill price for `entry_price`, not the
+    signal price), or roll back cleanly on cancel-with-zero-fills.
+    Tests: `test_entry_cancelled_without_fill_does_not_open_position`,
+    `test_entry_first_fill_opens_exits_with_actual_fill_price`.
+  - **Spread-aware limit offset** (same HKIT incident): a fixed
+    `limit_offset_cents=10` produced a LMT BUY at 0.37 on a stock
+    trading around 0.27 (37% of price). The executor now caps the
+    effective offset at `max(1c, 2% of mid)`, so cheap names get a
+    sane offset while normally-priced stocks ($5–$50) are unchanged.
+    Also journaled as `effective_offset_cents` for audit.
 - **2-day bootstrap + `require_5m_macd` toggle** (Wed 24 Jun PM): the
   engine now requests `durationStr="2 D"` of 1m historical bars on
   Arm (previously 4 hours), so 5m MACD warms instantly via

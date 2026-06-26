@@ -126,6 +126,7 @@ class Executor:
         used_anchor: str | None = None
         observed_bid: float | None = None
         observed_ask: float | None = None
+        offset: float = 0.0
         if order_type_norm == "LMT":
             if quote_ticker is None:
                 raise ValueError("LMT order requires quote_ticker")
@@ -136,20 +137,30 @@ class Executor:
                     "error",
                     {
                         "where": "executor.execute",
-                        "msg": "no NBBO available for LMT pricing; bid={} ask={}".format(bid, ask),
+                        "msg": f"no NBBO available for LMT pricing; bid={bid} ask={ask}",
                     },
                 )
                 return None
-            offset = limit_offset_cents / 100.0
+            requested_offset = limit_offset_cents / 100.0
+            # Spread-aware cap: a fixed 10c offset is appropriate for $5-$50
+            # stocks but absurd on sub-$1 names (HKIT incident Fri 26 Jun:
+            # ask 0.36 / bid 0.18 stock, 10c offset produced LMT BUY @ 0.37
+            # = 37% of price). Cap the EFFECTIVE offset to max(1c, 2% of
+            # mid). This stays close to the inside on cheap names without
+            # changing behaviour for normally-priced stocks (1c floor
+            # preserves marketable-LMT semantics).
+            mid = (bid + ask) / 2.0
+            cap = max(0.01, 0.02 * mid) if mid > 0 else requested_offset
+            offset = min(requested_offset, cap)
             if side_norm == "BUY":
                 limit_price = ask + offset
                 used_anchor = "ask"
             else:  # SELL
                 if sell_anchor_norm == "bid":
-                    limit_price = max(bid - offset, 0.01)
+                    limit_price = max(bid - offset, 0.0001)
                     used_anchor = "bid"
                 else:  # 'ask' - passive sell
-                    limit_price = max(ask - offset, 0.01)
+                    limit_price = max(ask - offset, 0.0001)
                     used_anchor = "ask"
 
         await self.journal.record(
@@ -160,6 +171,9 @@ class Executor:
                 "order_type": order_type_norm,
                 "limit_price": limit_price,
                 "limit_offset_cents": limit_offset_cents if order_type_norm == "LMT" else None,
+                "effective_offset_cents": (
+                    round(offset * 100.0, 4) if order_type_norm == "LMT" else None
+                ),
                 "anchor": used_anchor,
                 "sell_anchor_config": sell_anchor_norm if side_norm == "SELL" else None,
                 "observed_bid": observed_bid,
@@ -324,7 +338,7 @@ class Executor:
                 limit_price=None,
                 stop_price=None,
                 status=str(trade.orderStatus.status),
-                submitted_at=dt.datetime.now(dt.timezone.utc),
+                submitted_at=dt.datetime.now(dt.UTC),
                 raw={
                     "order": {
                         "orderId": trade.order.orderId,

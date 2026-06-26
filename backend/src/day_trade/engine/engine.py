@@ -63,6 +63,22 @@ class PendingApproval:
     future: asyncio.Future
 
 
+@dataclass(slots=True)
+class _PendingEntry:
+    """A BUY order that has been submitted to IBKR but not yet confirmed
+    filled OR cancelled with zero fills. Held by the engine between
+    `_handle_enter` (submit) and `_on_entry_fill` / `_on_entry_status`
+    (promote or rollback). The exit framework, risk.state position size,
+    and `_entry_price` are all gated on the FIRST fill so a cancelled
+    BUY never leaves us with a phantom position.
+    """
+
+    signal: Signal
+    trade: Any                          # ib_async Trade (kept untyped to avoid import cycle)
+    quantity: int
+    stop_suggestion: float
+
+
 @dataclass(frozen=True, slots=True)
 class EngineConfig:
     """User-facing config for one engine run.
@@ -153,6 +169,14 @@ class TradingEngine:
         self._holds_portfolio_mutex: bool = False
 
         self._pending: PendingApproval | None = None
+        # An unfilled BUY in flight (post-submit, pre-first-fill). Populated
+        # by _handle_enter; cleared by _on_entry_fill (promote to in-position)
+        # or _on_entry_status (rollback if cancelled with 0 fills). Without
+        # this, the engine optimistically opened the exit framework on
+        # SUBMIT — so a BUY that later cancelled left a "phantom position"
+        # that subsequent bars would try to exit. See HKIT incident
+        # Fri 26 Jun PM.
+        self._pending_entry: _PendingEntry | None = None
         self._stop_event = asyncio.Event()
         self._running_task: asyncio.Task | None = None
 
@@ -433,6 +457,29 @@ class TradingEngine:
         if self._pending is not None and not self._pending.future.done():
             self._pending.future.set_result(False)
 
+        # If we have a BUY in flight (submitted but not yet filled or
+        # cancelled), cancel it at IBKR. The _on_entry_status callback
+        # will then see status=Cancelled+filled=0 and roll back, but we
+        # also clear _pending_entry locally here so the rollback path
+        # is robust even if the status event arrives after we've torn
+        # down (e.g. if the WS disconnects mid-shutdown).
+        if self._pending_entry is not None:
+            pending_trade = self._pending_entry.trade
+            self._pending_entry = None
+            try:
+                self.ibkr.cancel_order(pending_trade)
+            except Exception:
+                logger.exception("failed to cancel pending BUY during stop")
+            if self.journal is not None:
+                await self.journal.record(
+                    "entry_cancelled_without_fill",
+                    {
+                        "ibkr_order_id": getattr(pending_trade.order, "orderId", None),
+                        "filled": int(getattr(pending_trade.orderStatus, "filled", 0) or 0),
+                        "msg": "engine stopping; pending BUY cancelled",
+                    },
+                )
+
         # Stop-while-holding-the-mutex semantics (Phase 1):
         #   If we still hold the portfolio mutex when stopped, release it
         #   with pnl=0 so sibling engines can resume. If we also have an
@@ -567,7 +614,7 @@ class TradingEngine:
                 {
                     "run_id": self.run_id,
                     "event_type": "bar_tick",
-                    "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "ts": dt.datetime.now(dt.UTC).isoformat(),
                     "payload": {
                         "ts": snapshot.ts.isoformat(),
                         "open": snapshot.open,
@@ -697,10 +744,20 @@ class TradingEngine:
                 return
             self._holds_portfolio_mutex = True
 
-        # ---- Submit ----
-        self.risk.record_open(self.config.quantity)
-        self._entry_price = signal.price
-        self._entry_ts = signal.ts
+        # ---- Submit (no position state opened yet — see _PendingEntry) ----
+        #
+        # Previously we did `risk.record_open(qty)` and `exits.open(...)`
+        # BEFORE the order even left the wire — so if IBKR later cancelled
+        # the BUY with 0 fills (wide-spread micro-cap, halt, etc.), the
+        # engine was left with a "phantom position": next bar's exit
+        # framework would fire HARD_STOP and submit a SELL to close
+        # something that never existed. Surfaced by HKIT incident
+        # Fri 26 Jun PM. Now we wait for IBKR to confirm the first fill
+        # before opening any position state. See `_on_entry_fill` /
+        # `_on_entry_status`.
+        stop_price = signal.extras.get("stop_suggestion") if signal.extras else None
+        if not isinstance(stop_price, (int, float)) or stop_price <= 0:
+            stop_price = signal.price * 0.99
 
         trade = await self.executor.execute(
             signal=signal,
@@ -713,39 +770,32 @@ class TradingEngine:
             quote_ticker=self._quote_ticker,
         )
         if trade is None:
-            # Submit failed - roll back state (incl. mutex release: nothing
-            # opened, so no risk of double-holding).
-            self.risk.record_close(realized_pnl_usd=0.0)
+            # Submit failed (never made it over the wire). Roll back the
+            # strategy latch and release the mutex.
             self.strategy.mark_exited()
-            self._entry_price = None
-            self._entry_ts = None
             await self._release_portfolio_mutex(realized_pnl_usd=0.0)
             return
 
-        # Open the exit-trigger framework against a sensible stop suggestion.
-        # The FirstPullback strategy exposes `suggest_stop_price`; legacy
-        # strategies don't, in which case we fall back to entry - 1%.
-        stop_price = signal.extras.get("stop_suggestion") if signal.extras else None
-        if not isinstance(stop_price, (int, float)) or stop_price <= 0:
-            stop_price = signal.price * 0.99
-        try:
-            self.exits.open(
-                entry_price=signal.price,
-                stop_price=float(stop_price),
-                entry_ts=signal.ts,
-                quantity=self.config.quantity,
-            )
-        except ValueError:
-            # If stop >= entry (shouldn't happen for longs but be defensive),
-            # widen to 1% below entry.
-            self.exits.open(
-                entry_price=signal.price,
-                stop_price=signal.price * 0.99,
-                entry_ts=signal.ts,
-                quantity=self.config.quantity,
-            )
-
+        # Latch the strategy NOW (even though the order isn't filled) so it
+        # doesn't re-emit ENTER_LONG on the very next bar while we wait. We
+        # unlatch via mark_exited() if the order ends up cancelled with 0
+        # fills (see _on_entry_status).
         self.strategy.mark_entered()
+
+        self._pending_entry = _PendingEntry(
+            signal=signal,
+            trade=trade,
+            quantity=self.config.quantity,
+            stop_suggestion=float(stop_price),
+        )
+
+        # Wire engine-level fill / status hooks on top of the executor's
+        # journaling subscribers. ib_async events accept sync callables
+        # only; we forward into asyncio tasks ourselves. These coexist
+        # with executor._on_status / executor._on_fill.
+        loop = asyncio.get_running_loop()
+        trade.fillEvent += lambda t, _fill: loop.create_task(self._on_entry_fill(t))
+        trade.statusEvent += lambda t: loop.create_task(self._on_entry_status(t))
 
     # --- exit path ---
 
@@ -866,6 +916,116 @@ class TradingEngine:
         self._pending.future.set_result(False)
         return True
 
+    # --- pending-entry transitions (BUY submitted, awaiting fill) ---
+
+    async def _on_entry_fill(self, trade: Any) -> None:
+        """Called by ib_async when our pending BUY gets a fill (partial or
+        full). On the FIRST fill we promote the pending entry into a real
+        in-position state: set entry price, open the exit framework,
+        record the position size on the risk gate. Subsequent partial-fill
+        events on the same trade just resize the position to the new
+        total filled.
+        """
+        pe = self._pending_entry
+        if pe is None or pe.trade is not trade:
+            return
+        if self.risk is None or self.journal is None:
+            return
+
+        filled = int(getattr(trade.orderStatus, "filled", 0) or 0)
+        avg_px = float(getattr(trade.orderStatus, "avgFillPrice", 0.0) or 0.0)
+        if filled <= 0 or avg_px <= 0.0:
+            return
+
+        # Idempotent: record_open just sets the field, so on partial-then-
+        # completion fills we just re-sync to the current total filled.
+        self.risk.record_open(filled)
+
+        if self._entry_price is None:
+            # First fill: open exits framework anchored to the ACTUAL fill
+            # price (better than signal price, which is what we previously
+            # used). Stop price comes from the pending entry's
+            # `stop_suggestion`.
+            self._entry_price = avg_px
+            self._entry_ts = pe.signal.ts
+            try:
+                if self.exits is not None:
+                    self.exits.open(
+                        entry_price=avg_px,
+                        stop_price=pe.stop_suggestion,
+                        entry_ts=pe.signal.ts,
+                        quantity=filled,
+                    )
+            except ValueError:
+                # Defensive: stop >= entry shouldn't happen for longs.
+                if self.exits is not None:
+                    self.exits.open(
+                        entry_price=avg_px,
+                        stop_price=avg_px * 0.99,
+                        entry_ts=pe.signal.ts,
+                        quantity=filled,
+                    )
+            await self.journal.record(
+                "entry_promoted",
+                {
+                    "ibkr_order_id": getattr(trade.order, "orderId", None),
+                    "filled": filled,
+                    "avg_fill_price": avg_px,
+                    "stop_price": pe.stop_suggestion,
+                    "signal_ts": pe.signal.ts.isoformat(),
+                    "msg": (
+                        "pending BUY confirmed filled at IBKR; position state "
+                        "and exit framework now active"
+                    ),
+                },
+            )
+
+    async def _on_entry_status(self, trade: Any) -> None:
+        """Called by ib_async on every status change for our pending BUY.
+        We watch for terminal states: a Cancelled/Inactive status with
+        ZERO fills means rollback (release mutex, unlatch strategy);
+        Filled or Cancelled-with-partial-fills means clear pending (the
+        position is now managed normally by the exit framework).
+        """
+        pe = self._pending_entry
+        if pe is None or pe.trade is not trade:
+            return
+        if self.journal is None:
+            return
+
+        status = str(getattr(trade.orderStatus, "status", "") or "").lower()
+        filled = int(getattr(trade.orderStatus, "filled", 0) or 0)
+
+        if status in ("cancelled", "apicancelled", "inactive") and filled == 0:
+            # Pure cancel with no fill: roll back ALL the entry-side state
+            # we set up in _handle_enter.
+            self._pending_entry = None
+            await self.journal.record(
+                "entry_cancelled_without_fill",
+                {
+                    "ibkr_order_id": getattr(trade.order, "orderId", None),
+                    "status": getattr(trade.orderStatus, "status", None),
+                    "filled": filled,
+                    "signal_ts": pe.signal.ts.isoformat(),
+                    "msg": (
+                        "BUY cancelled without filling; no position opened, "
+                        "exit framework not armed. Mutex released and "
+                        "strategy unlatched."
+                    ),
+                },
+            )
+            if self.strategy is not None:
+                self.strategy.mark_exited()
+            await self._release_portfolio_mutex(realized_pnl_usd=0.0)
+            return
+
+        # Terminal "we have a position" states: clear pending; the in-
+        # position state is now owned by exits + risk.
+        if status == "filled" or (
+            status in ("cancelled", "apicancelled", "inactive") and filled > 0
+        ):
+            self._pending_entry = None
+
     # --- features ---
 
     def _snapshot_features(self, ts: dt.datetime) -> FeatureSnapshot | None:
@@ -977,7 +1137,7 @@ class TradingEngine:
                 return
             row.status = status
             if status in ("stopped", "error"):
-                row.stopped_at = dt.datetime.now(dt.timezone.utc)
+                row.stopped_at = dt.datetime.now(dt.UTC)
                 if reason:
                     row.stop_reason = reason
 
