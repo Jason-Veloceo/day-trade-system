@@ -5,6 +5,7 @@ import useSWR from "swr";
 import {
   approveEngine,
   fetcher,
+  getEngineRunEvents,
   rejectEngine,
   resetPortfolioKillSwitch,
   startEngine,
@@ -13,6 +14,7 @@ import {
 } from "@/lib/api";
 import type {
   EngineDtdContext,
+  EngineEvent,
   EngineFeatureSnapshot,
   EnginePortfolioStatus,
   EngineRegistryStatus,
@@ -166,14 +168,40 @@ export default function EnginePage() {
     [messages]
   );
 
+  // Hydrate the selected engine's event log + chart with the run's
+  // journal history from the DB. Without this, every page refresh
+  // dropped the entry/exit markers, P&L context, and the full audit
+  // trail — even though the events were saved correctly server-side.
+  // We refetch when the selected run_id changes and rely on the live
+  // WS stream to append everything since the fetch resolved.
+  const { data: historicalEvents } = useSWR<EngineEvent[]>(
+    selectedEngine?.run_id != null
+      ? `/engine/runs/${selectedEngine.run_id}/events`
+      : null,
+    () => getEngineRunEvents(selectedEngine!.run_id, { limit: 5000 }),
+    { revalidateOnFocus: false, refreshInterval: 0 }
+  );
+
   // Filter the shared WS stream down to the selected engine's events
-  // for the chart + event log. The "Recent runs" panel keeps showing
-  // all runs across all engines.
+  // for the chart + event log, then prepend the historical events.
+  // Historical events are converted to the WsMessage shape so EventLog
+  // and EngineChart can consume them uniformly. The "Recent runs"
+  // panel keeps showing all runs across all engines.
   const selectedEngineEvents = useMemo(() => {
     const rid = selectedEngine?.run_id;
     if (rid == null) return [];
-    return engineEvents.filter((m) => m.payload?.run_id === rid);
-  }, [engineEvents, selectedEngine?.run_id]);
+    const historicalAsWs: WsMessage[] = (historicalEvents ?? []).map((e) => ({
+      topic: `engine.${e.event_type}`,
+      payload: {
+        run_id: e.run_id,
+        event_type: e.event_type,
+        ts: e.ts,
+        payload: e.payload,
+      },
+    }));
+    const live = engineEvents.filter((m) => m.payload?.run_id === rid);
+    return [...historicalAsWs, ...live];
+  }, [engineEvents, selectedEngine?.run_id, historicalEvents]);
 
   const lastEventIdRef = useRef<number>(-1);
   useEffect(() => {

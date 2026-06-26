@@ -468,6 +468,10 @@ class TradingEngine:
                     "trades_count": self.risk.state.trades_count if self.risk else 0,
                 },
             )
+        # Belt-and-suspenders: persist final stats even if a close path
+        # somehow didn't (e.g. stop called while in position, or future
+        # exit paths added without remembering to call _persist_run_stats).
+        await self._persist_run_stats()
         await self._set_run_status("stopped", reason=reason)
 
     # --- bar consumers ---
@@ -791,17 +795,19 @@ class TradingEngine:
             quote_ticker=self._quote_ticker,
         )
 
-        # P&L tracked via fill callbacks (TODO once we wire realized pnl back).
-        # For now we increment trades_count optimistically on full close.
+        # P&L approximation on full close. The same approximation goes to
+        # BOTH the per-engine risk.state and the portfolio mutex so the
+        # Active-run panel, Portfolio top bar, and engine_runs row all
+        # agree on what happened. The number is `(bar.close - entry_price)
+        # * qty` — gross of commissions and using bar close rather than
+        # actual fill price. Good enough for the daily kill switch + the
+        # Recent Runs table; fill-accurate P&L (avg buy fill vs avg sell
+        # fill, net of commissions) is a TODO that ties into the
+        # fill-callback refactor planned alongside the exit-framework
+        # redesign.
         if qty >= held:
-            # Approximate realized P&L for portfolio-mutex accounting:
-            # (bar.close - entry_price) * qty. This is gross of commissions
-            # and uses the bar's close rather than the actual fill price, so
-            # it's only accurate enough for the daily kill switch, NOT for
-            # the trade journal. Per-trade fill-accurate P&L is tracked
-            # separately when we wire fill callbacks back (TODO).
             approx_pnl = self._approx_realized_pnl(bar.close, held)
-            self.risk.record_close(realized_pnl_usd=0.0)
+            self.risk.record_close(realized_pnl_usd=approx_pnl)
             # Track whether this was a losing trade for the backside score.
             if self._entry_price is not None and bar.close < self._entry_price:
                 self.strategy.record_failed_setup()
@@ -809,6 +815,7 @@ class TradingEngine:
             self._entry_ts = None
             self.exits.close()
             self.strategy.mark_exited()
+            await self._persist_run_stats()
             await self._release_portfolio_mutex(realized_pnl_usd=approx_pnl)
 
     async def _handle_exit_signal(self, signal: Signal) -> None:
@@ -835,13 +842,14 @@ class TradingEngine:
             quote_ticker=self._quote_ticker,
         )
         approx_pnl = self._approx_realized_pnl(signal.price, qty)
-        self.risk.record_close(realized_pnl_usd=0.0)
+        self.risk.record_close(realized_pnl_usd=approx_pnl)
         self._entry_price = None
         self._entry_ts = None
         if self.exits is not None:
             self.exits.close()
         if self.strategy is not None:
             self.strategy.mark_exited()
+        await self._persist_run_stats()
         await self._release_portfolio_mutex(realized_pnl_usd=approx_pnl)
 
     # --- approval API (called from REST handler) ---
@@ -972,6 +980,29 @@ class TradingEngine:
                 row.stopped_at = dt.datetime.now(dt.timezone.utc)
                 if reason:
                     row.stop_reason = reason
+
+    async def _persist_run_stats(self) -> None:
+        """Snapshot per-engine trade count + realized P&L back onto the
+        `engine_runs` row so the Recent Runs table reflects what actually
+        happened during this run. Called on every position-flat (in both
+        exit paths) and once more from stop() as a final safety net.
+
+        This is the same approximate-P&L value that goes to the portfolio
+        mutex, NOT a fill-accurate per-trade aggregation — see the comment
+        on `_approx_realized_pnl`. Once we wire fill callbacks back, this
+        method will pull from the fill-accurate accumulator instead.
+        """
+        if self.run_id is None or self.risk is None:
+            return
+        try:
+            async with session_scope() as s:
+                row = await s.get(EngineRun, self.run_id)
+                if row is None:
+                    return
+                row.realized_pnl = Decimal(str(self.risk.state.realized_pnl_usd))
+                row.trades_count = self.risk.state.trades_count
+        except Exception:
+            logger.exception("failed to persist run stats")
 
     async def _persist_bar(self, bar: Bar, snapshot: dict[str, Any]) -> None:
         if self.run_id is None:
