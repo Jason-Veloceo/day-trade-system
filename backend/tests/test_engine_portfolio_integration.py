@@ -244,8 +244,9 @@ async def test_handle_enter_denied_when_kill_switch_on() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_enter_does_not_consult_mutex_when_portfolio_risk_is_none() -> None:
-    """Back-compat: legacy single-engine EngineRunner constructs the
-    engine WITHOUT a portfolio_risk. The mutex code must be inert."""
+    """Constructing a TradingEngine without a portfolio_risk (e.g. in
+    a unit test that's exercising legacy v1.1 paths) must leave the
+    mutex code path inert. No acquire, no journal block event."""
     engine, journal, executor, _, _ = _build_engine()
     engine.portfolio_risk = None
 

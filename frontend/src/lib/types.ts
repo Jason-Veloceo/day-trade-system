@@ -146,14 +146,17 @@ export interface EngineFeatureSnapshot {
   has_tape: boolean;
 }
 
+// Per-engine status (one entry in EngineRegistryStatus.engines).
+// The optional `active` field is kept for backwards compatibility with
+// the v1.2 single-engine response shape but always true in v1.3+.
 export interface EngineStatus {
-  active: boolean;
-  run_id?: number | null;
-  status?: string | null;
-  symbol?: string | null;
-  strategy?: string | null;
-  autonomous?: boolean | null;
-  quantity?: number | null;
+  active?: boolean;
+  run_id: number;
+  status: string;
+  symbol: string;
+  strategy: string;
+  autonomous: boolean;
+  quantity: number;
   ibkr_account?: string | null;
   order_type?: string | null;
   limit_offset_cents?: number | null;
@@ -204,6 +207,38 @@ export interface EngineStatus {
   } | null;
   features?: EngineFeatureSnapshot | null;
   has_pending_approval?: boolean | null;
+}
+
+// Portfolio-level risk gate state. Shared across every engine in the
+// registry; enforces "1 open position at a time" + daily caps.
+export interface EnginePortfolioCaps {
+  max_daily_loss_usd: number;
+  max_concurrent_engines: number;
+  max_total_trades_per_day: number;
+}
+
+export interface EnginePortfolioStatus {
+  caps: EnginePortfolioCaps;
+  holder: string | null;
+  is_holding: boolean;
+  realized_pnl_usd: number;
+  trades_count: number;
+  kill_switch_on: boolean;
+  day_utc: string | null;
+}
+
+export interface EngineSlotsStatus {
+  active: number;
+  max: number;
+}
+
+// Top-level GET /engine/status response (v1.3+). Lists every active
+// engine in the registry plus the shared portfolio gate state and the
+// slot capacity summary.
+export interface EngineRegistryStatus {
+  engines: EngineStatus[];
+  portfolio: EnginePortfolioStatus;
+  slots: EngineSlotsStatus;
 }
 
 export interface EngineRun {

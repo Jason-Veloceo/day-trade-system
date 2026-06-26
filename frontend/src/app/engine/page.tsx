@@ -6,6 +6,7 @@ import { approveEngine, fetcher, rejectEngine, startEngine, stopEngine } from "@
 import type {
   EngineDtdContext,
   EngineFeatureSnapshot,
+  EngineRegistryStatus,
   EngineRun,
   EngineStartIn,
   EngineStatus,
@@ -97,7 +98,13 @@ const DEFAULT_START: EngineStartIn = {
 };
 
 export default function EnginePage() {
-  const { data: status, mutate: refetchStatus } = useSWR<EngineStatus>(
+  // v1.3: /engine/status returns the multi-engine registry shape
+  // {engines: [...], portfolio: ..., slots: ...}. This page is still
+  // the single-engine view; the full multi-card dashboard ships in
+  // Phase 1 Day 4. For now we display the first active engine; if more
+  // than one is running, the rest are temporarily not visible here
+  // (but still running on the backend — visit /engine/status to see all).
+  const { data: registry, mutate: refetchStatus } = useSWR<EngineRegistryStatus>(
     "/engine/status",
     fetcher,
     { revalidateOnFocus: false, refreshInterval: 2000 }
@@ -127,7 +134,11 @@ export default function EnginePage() {
     refetchStatus();
   }, [engineEvents.length, refetchStatus]);
 
-  const active = !!status?.active;
+  // The single engine this page is currently displaying (the first
+  // active engine in the registry, if any).
+  const engine = useMemo(() => registry?.engines?.[0], [registry]);
+  const active = !!engine;
+  const extraEngines = (registry?.engines?.length ?? 0) - 1;
 
   async function handleStart() {
     setBusy(true);
@@ -143,9 +154,10 @@ export default function EnginePage() {
   }
 
   async function handleStop() {
+    if (!engine) return;
     setBusy(true);
     try {
-      await stopEngine();
+      await stopEngine(engine.symbol);
       await refetchStatus();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -155,9 +167,10 @@ export default function EnginePage() {
   }
 
   async function handleApprove() {
+    if (!engine) return;
     setBusy(true);
     try {
-      await approveEngine();
+      await approveEngine(engine.run_id);
       await refetchStatus();
     } finally {
       setBusy(false);
@@ -165,9 +178,10 @@ export default function EnginePage() {
   }
 
   async function handleReject() {
+    if (!engine) return;
     setBusy(true);
     try {
-      await rejectEngine();
+      await rejectEngine(engine.run_id);
       await refetchStatus();
     } finally {
       setBusy(false);
@@ -203,41 +217,51 @@ export default function EnginePage() {
       </div>
 
       <PendingApprovalBanner
-        status={status}
+        status={engine}
         onApprove={handleApprove}
         onReject={handleReject}
         busy={busy}
       />
 
+      {extraEngines > 0 ? (
+        <div className="rounded-xl border border-sky-200 bg-sky-50 px-5 py-3 text-sm text-sky-800 shadow-sm">
+          <span className="font-semibold">Multi-engine note:</span>{" "}
+          {extraEngines} additional engine
+          {extraEngines === 1 ? " is" : "s are"} also running on the backend
+          but {extraEngines === 1 ? "is" : "are"} not displayed on this page yet
+          (single-engine UI). The multi-card dashboard ships in the next slice.
+        </div>
+      ) : null}
+
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card title={active ? "Active run" : "Arm a symbol"}>
           {active ? (
-            <ActiveRunPanel status={status!} onStop={handleStop} busy={busy} />
+            <ActiveRunPanel status={engine!} onStop={handleStop} busy={busy} />
           ) : (
             <StartForm form={form} setForm={setForm} onStart={handleStart} busy={busy} err={err} />
           )}
         </Card>
 
         <Card title="Strategy state">
-          <StrategyStatePanel status={status} />
+          <StrategyStatePanel status={engine} />
         </Card>
       </div>
 
       {active ? (
         <Card title="Live features (L2 / T&S / VWAP)">
           <FeaturePanel
-            features={status?.features ?? null}
-            enableDepth={status?.enable_depth ?? false}
-            enableTape={status?.enable_tape ?? false}
+            features={engine?.features ?? null}
+            enableDepth={engine?.enable_depth ?? false}
+            enableTape={engine?.enable_tape ?? false}
           />
         </Card>
       ) : null}
 
-      {active && status?.run_id ? (
+      {active && engine?.run_id ? (
         <Card title="Chart">
           <EngineChart
-            runId={status.run_id}
-            symbol={status.symbol ?? ""}
+            runId={engine.run_id}
+            symbol={engine.symbol ?? ""}
             events={engineEvents}
           />
         </Card>

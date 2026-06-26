@@ -1,15 +1,22 @@
-"""REST API for the POC trading engine.
+"""REST API for the v1.3 multi-engine trading engine.
 
-  POST /engine/start                    -> start a new run
-  POST /engine/stop                     -> stop the active run
-  POST /engine/approve                  -> approve a parked signal (non-autonomous run)
-  POST /engine/reject                   -> reject a parked signal
-  GET  /engine/status                   -> current active run + state snapshot
-  GET  /engine/runs                     -> recent runs (paginated)
-  GET  /engine/runs/{run_id}            -> single run detail
-  GET  /engine/runs/{run_id}/events     -> audit-log events (paginated)
-  GET  /engine/runs/{run_id}/bars       -> persisted 1m bars (for chart)
-  GET  /engine/strategies               -> registry of available strategies
+  POST /engine/start                       -> start a new engine for a symbol
+  POST /engine/stop?symbol=X               -> stop the engine running on X
+  POST /engine/stop_all                    -> stop every active engine
+  POST /engine/approve?run_id=X            -> approve a parked signal
+  POST /engine/reject?run_id=X             -> reject a parked signal
+  GET  /engine/status                      -> all engines + portfolio + slots
+  GET  /engine/portfolio                   -> just the portfolio gate snapshot
+  POST /engine/portfolio/reset_kill_switch -> manually clear the daily kill switch
+  GET  /engine/runs                        -> recent runs (paginated)
+  GET  /engine/runs/{run_id}               -> single run detail
+  GET  /engine/runs/{run_id}/events        -> audit-log events (paginated)
+  GET  /engine/runs/{run_id}/bars          -> persisted 1m bars (for chart)
+  GET  /engine/strategies                  -> registry of available strategies
+
+Migration note (v1.2 -> v1.3): /engine/stop, /engine/approve, /engine/reject
+now require their respective ?symbol / ?run_id query parameters. /engine/status
+returns a list of engines under `engines`, not a single flat object.
 """
 
 from __future__ import annotations
@@ -26,8 +33,12 @@ from sqlalchemy import desc, select
 from day_trade.db.models import BarAggregate, EngineEvent, EngineRun
 from day_trade.db.session import session_scope
 from day_trade.engine.ibkr_client import IBKRConnectionError, IBKRSafetyError
+from day_trade.engine.registry import (
+    EngineAlreadyRunningError,
+    EngineSlotFullError,
+    get_registry,
+)
 from day_trade.engine.risk import RiskCaps
-from day_trade.engine.runner import EngineBusyError, get_runner
 from day_trade.engine.strategies import STRATEGIES
 
 logger = logging.getLogger(__name__)
@@ -93,25 +104,35 @@ class StartIn(BaseModel):
 
 class StartOut(BaseModel):
     run_id: int
+    symbol: str
     status: str
 
 
 class StopOut(BaseModel):
     stopped: bool
+    symbol: str
+
+
+class StopAllOut(BaseModel):
+    stopped: int
 
 
 class ApprovalOut(BaseModel):
     handled: bool
 
 
-class StatusOut(BaseModel):
-    active: bool
-    run_id: int | None = None
-    status: str | None = None
-    symbol: str | None = None
-    strategy: str | None = None
-    autonomous: bool | None = None
-    quantity: int | None = None
+class EngineStatusItem(BaseModel):
+    """Per-engine status. Same shape as the legacy single-engine
+    StatusOut, except `active` is implicit (only active engines appear
+    in the list) and `symbol` is always populated."""
+
+    active: bool = True
+    run_id: int
+    status: str
+    symbol: str
+    strategy: str
+    autonomous: bool
+    quantity: int
     ibkr_account: str | None = None
     order_type: str | None = None
     limit_offset_cents: float | None = None
@@ -125,6 +146,36 @@ class StatusOut(BaseModel):
     strategy_state: dict[str, Any] | None = None
     features: dict[str, Any] | None = None
     has_pending_approval: bool | None = None
+
+
+class PortfolioCapsOut(BaseModel):
+    max_daily_loss_usd: float
+    max_concurrent_engines: int
+    max_total_trades_per_day: int
+
+
+class PortfolioStatusOut(BaseModel):
+    caps: PortfolioCapsOut
+    holder: str | None
+    is_holding: bool
+    realized_pnl_usd: float
+    trades_count: int
+    kill_switch_on: bool
+    day_utc: str | None
+
+
+class SlotsStatusOut(BaseModel):
+    active: int
+    max: int
+
+
+class StatusOut(BaseModel):
+    """Top-level registry status: list of active engines, portfolio gate
+    snapshot, and the slot capacity summary."""
+
+    engines: list[EngineStatusItem]
+    portfolio: PortfolioStatusOut
+    slots: SlotsStatusOut
 
 
 class RunOut(BaseModel):
@@ -215,7 +266,16 @@ async def list_strategies() -> list[StrategyOut]:
 
 @router.post("/start", response_model=StartOut)
 async def start(body: StartIn) -> StartOut:
-    runner = get_runner()
+    """Start a new engine for `body.symbol`. Errors:
+      - 409 EngineAlreadyRunningError: an engine for that symbol is
+        already active (stop it first or use drop-and-replace).
+      - 409 EngineSlotFullError: registry already at
+        max_concurrent_engines.
+      - 403 IBKRSafetyError: paper/live safety guards refused.
+      - 502 IBKRConnectionError: TWS / Gateway unreachable.
+      - 400 KeyError / ValueError: invalid strategy or params.
+    """
+    registry = get_registry()
     caps = RiskCaps(
         max_trades_per_run=body.risk_caps.max_trades_per_run,
         max_position_value_usd=body.risk_caps.max_position_value_usd,
@@ -223,7 +283,7 @@ async def start(body: StartIn) -> StartOut:
         max_daily_loss_usd=body.risk_caps.max_daily_loss_usd,
     )
     try:
-        run_id = await runner.start(
+        run_id = await registry.start(
             symbol=body.symbol,
             strategy_name=body.strategy_name,
             strategy_params=body.strategy_params,
@@ -239,7 +299,9 @@ async def start(body: StartIn) -> StartOut:
             require_5m_macd=body.require_5m_macd,
             dtd_context=body.dtd_context.model_dump(exclude_none=True),
         )
-    except EngineBusyError as e:
+    except EngineAlreadyRunningError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except EngineSlotFullError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except IBKRSafetyError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
@@ -249,29 +311,61 @@ async def start(body: StartIn) -> StartOut:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return StartOut(run_id=run_id, status="running")
+    return StartOut(run_id=run_id, symbol=body.symbol, status="running")
 
 
 @router.post("/stop", response_model=StopOut)
-async def stop() -> StopOut:
-    runner = get_runner()
-    stopped = await runner.stop(reason="user_stop")
-    return StopOut(stopped=stopped)
+async def stop(
+    symbol: str = Query(..., min_length=1, max_length=20, description="Symbol to stop"),
+) -> StopOut:
+    """Stop the engine running on `symbol`. Returns `stopped=false` if
+    no active engine existed for that symbol (idempotent)."""
+    stopped = await get_registry().stop(symbol, reason="user_stop")
+    return StopOut(stopped=stopped, symbol=symbol)
+
+
+@router.post("/stop_all", response_model=StopAllOut)
+async def stop_all() -> StopAllOut:
+    """Stop every active engine in the registry. Returns the count of
+    engines stopped."""
+    count = await get_registry().stop_all(reason="user_stop_all")
+    return StopAllOut(stopped=count)
 
 
 @router.post("/approve", response_model=ApprovalOut)
-async def approve() -> ApprovalOut:
-    return ApprovalOut(handled=get_runner().approve())
+async def approve(
+    run_id: int = Query(..., ge=1, description="run_id of the engine with the pending approval"),
+) -> ApprovalOut:
+    return ApprovalOut(handled=get_registry().approve(run_id))
 
 
 @router.post("/reject", response_model=ApprovalOut)
-async def reject() -> ApprovalOut:
-    return ApprovalOut(handled=get_runner().reject())
+async def reject(
+    run_id: int = Query(..., ge=1, description="run_id of the engine with the pending approval"),
+) -> ApprovalOut:
+    return ApprovalOut(handled=get_registry().reject(run_id))
 
 
 @router.get("/status", response_model=StatusOut)
 async def status() -> StatusOut:
-    return StatusOut(**get_runner().status())
+    return StatusOut(**get_registry().status())
+
+
+@router.get("/portfolio", response_model=PortfolioStatusOut)
+async def get_portfolio() -> PortfolioStatusOut:
+    """Just the portfolio gate snapshot, without the per-engine list.
+    Used by the top-bar summary in the dashboard."""
+    return PortfolioStatusOut(**get_registry().portfolio_risk.snapshot())
+
+
+@router.post("/portfolio/reset_kill_switch", response_model=PortfolioStatusOut)
+async def reset_kill_switch() -> PortfolioStatusOut:
+    """Manually clear the daily kill switch. Used when the operator has
+    reviewed the day's trades and explicitly wants to re-arm the bot
+    before UTC midnight. Realized P&L and trade counter are preserved."""
+    registry = get_registry()
+    await registry.portfolio_risk.reset_kill_switch()
+    return PortfolioStatusOut(**registry.portfolio_risk.snapshot())
 
 
 @router.get("/runs", response_model=list[RunOut])

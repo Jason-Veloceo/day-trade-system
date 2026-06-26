@@ -1,16 +1,13 @@
 """Process-wide engine registry — Phase 1 multi-engine substrate.
 
-Replaces the single-engine `EngineRunner` with a registry that can hold
-up to N concurrent `TradingEngine` instances (one per symbol), each fully
-independent (own bars, indicators, gates, exits, journal). All engines
-share a single `PortfolioRiskGate` that enforces "at most ONE open
-position at any time" across the whole registry.
+Owns up to N concurrent `TradingEngine` instances (one per symbol), each
+fully independent (own bars, indicators, gates, exits, journal). All
+engines share a single `PortfolioRiskGate` that enforces "at most ONE
+open position at any time" across the whole registry.
 
-This module is the new owner of engine lifecycle for v1.3+. The legacy
-`EngineRunner` (in `runner.py`) continues to exist alongside during the
-migration — the API layer cuts over in Day 3 of the multi-engine slice.
-
-See `docs/multi_engine_design.md` for the architecture decisions.
+This is the v1.3+ owner of engine lifecycle. Replaced the single-engine
+`EngineRunner` in the Day 3 API cutover. See
+`docs/multi_engine_design.md` for the architecture decisions.
 """
 
 from __future__ import annotations

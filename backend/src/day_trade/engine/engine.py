@@ -122,10 +122,10 @@ class TradingEngine:
         self.broker = broker
         self.settings = settings or get_settings()
         # When set, the engine consults this gate before submitting any
-        # entry order and releases it on position-flat. Multi-engine
-        # registries wire this in; the legacy single-engine EngineRunner
-        # leaves it None and the engine behaves as v1.1 (no portfolio
-        # mutex). See docs/multi_engine_design.md.
+        # entry order and releases it on position-flat. The production
+        # EngineRegistry always wires this in. Tests that construct a
+        # TradingEngine directly may pass None to skip mutex enforcement
+        # (engine behaves as v1.1). See docs/multi_engine_design.md.
         self.portfolio_risk = portfolio_risk
 
         self.spec: InstrumentSpec | None = None
