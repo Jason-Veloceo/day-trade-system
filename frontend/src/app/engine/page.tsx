@@ -156,14 +156,6 @@ export default function EnginePage() {
     }
   }, [engines, selectedSymbol]);
 
-  // Auto-exit add-engine mode once the engine actually starts.
-  useEffect(() => {
-    if (addEngineMode && engines.some((e) => e.symbol === form.symbol)) {
-      setAddEngineMode(false);
-      setSelectedSymbol(form.symbol);
-    }
-  }, [addEngineMode, engines, form.symbol]);
-
   const selectedEngine = useMemo(
     () => engines.find((e) => e.symbol === selectedSymbol),
     [engines, selectedSymbol]
@@ -197,8 +189,13 @@ export default function EnginePage() {
     try {
       await startEngine(form);
       await refetchStatus();
-      // selectedSymbol will be set to form.symbol by the auto-exit-add
-      // effect once the engine appears in the registry.
+      // Arm succeeded — leave add mode and pin the new engine as the
+      // sidebar selection. Done imperatively in the success branch
+      // (not via an effect) so it can't accidentally fire when the
+      // form's symbol field happens to match an already-running engine
+      // before the user even submits.
+      setAddEngineMode(false);
+      setSelectedSymbol(form.symbol);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
