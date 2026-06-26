@@ -160,7 +160,12 @@ class TradingEngine:
     def status(self) -> str:
         if self._stop_event.is_set():
             return "stopped"
-        if self._running_task is None:
+        # `feed` is the last thing wired in start(), right before it
+        # returns. Once it's non-None we're past bootstrap and live bars
+        # are flowing into the strategy — i.e. genuinely running.
+        # (The legacy _running_task field was a dead check; the engine
+        # doesn't run as a top-level task, it runs via callbacks.)
+        if self.feed is None:
             return "starting"
         return "running"
 
