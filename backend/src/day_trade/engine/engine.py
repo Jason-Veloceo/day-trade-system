@@ -37,14 +37,15 @@ from day_trade.ws import topics as T
 from day_trade.ws.broker import MessageBroker
 
 from .bars import BarFeed, PartialBar
-from .exits import ExitConfig, ExitDecision, ExitEvaluationInputs, ExitTriggerSet
 from .executor import Executor
+from .exits import ExitConfig, ExitDecision, ExitEvaluationInputs, ExitTriggerSet
 from .features import FeatureSnapshot, compute_snapshot
 from .ibkr_client import IBKRClient
 from .instruments import InstrumentSpec, build_contract
 from .journal import Journal
 from .multitf import HigherTimeframeAggregator
 from .orderbook import MarketState
+from .portfolio_risk import PortfolioRiskGate
 from .risk import RiskCaps, RiskGate
 from .strategies import Strategy, get_strategy
 from .strategies.base import Bar, Signal, SignalKind
@@ -114,11 +115,18 @@ class TradingEngine:
         ibkr: IBKRClient,
         broker: MessageBroker,
         settings: Settings | None = None,
+        portfolio_risk: PortfolioRiskGate | None = None,
     ) -> None:
         self.config = config
         self.ibkr = ibkr
         self.broker = broker
         self.settings = settings or get_settings()
+        # When set, the engine consults this gate before submitting any
+        # entry order and releases it on position-flat. Multi-engine
+        # registries wire this in; the legacy single-engine EngineRunner
+        # leaves it None and the engine behaves as v1.1 (no portfolio
+        # mutex). See docs/multi_engine_design.md.
+        self.portfolio_risk = portfolio_risk
 
         self.spec: InstrumentSpec | None = None
         self.run_id: int | None = None
@@ -138,6 +146,11 @@ class TradingEngine:
         # Open-position bookkeeping for exit triggers (we own the entry context).
         self._entry_price: float | None = None
         self._entry_ts: dt.datetime | None = None
+
+        # True iff WE currently hold the portfolio mutex. Used to ensure
+        # we only release a mutex we ourselves acquired (defense-in-depth
+        # for the asymmetric release case where stop() runs unexpectedly).
+        self._holds_portfolio_mutex: bool = False
 
         self._pending: PendingApproval | None = None
         self._stop_event = asyncio.Event()
@@ -415,6 +428,32 @@ class TradingEngine:
         if self._pending is not None and not self._pending.future.done():
             self._pending.future.set_result(False)
 
+        # Stop-while-holding-the-mutex semantics (Phase 1):
+        #   If we still hold the portfolio mutex when stopped, release it
+        #   with pnl=0 so sibling engines can resume. If we also have an
+        #   open IBKR position, that position lingers — Phase 1 does NOT
+        #   auto-close on stop (matches legacy single-engine behaviour),
+        #   so we log a warning. Phase 1 safety hardening (in the design
+        #   doc) covers the orphan-position recovery on backend restart.
+        if self._holds_portfolio_mutex:
+            open_qty = self.risk.state.open_position_qty if self.risk else 0
+            if open_qty > 0 and self.journal is not None:
+                await self.journal.record(
+                    "warning",
+                    {
+                        "where": "stop",
+                        "msg": (
+                            "stopping engine while position is open at IBKR; "
+                            "portfolio mutex released to unblock sibling "
+                            "engines but the IBKR position must be closed "
+                            "manually"
+                        ),
+                        "open_qty": open_qty,
+                        "entry_price": self._entry_price,
+                    },
+                )
+            await self._release_portfolio_mutex(realized_pnl_usd=0.0)
+
         if self.journal is not None:
             await self.journal.record(
                 "engine_stop",
@@ -613,6 +652,42 @@ class TradingEngine:
                 {"action": "auto_execute_enter", "qty": self.config.quantity, "ts": signal.ts.isoformat()},
             )
 
+        # ---- Portfolio execution mutex ----
+        # In multi-engine mode, every entry must acquire the portfolio-wide
+        # mutex (enforces 1 open position across all engines) and pass the
+        # portfolio-level caps (daily loss kill switch, total-trades-per-day).
+        # Deferred until just before submit so we don't block siblings during
+        # the approval wait in non-autonomous mode. See
+        # docs/multi_engine_design.md decisions 1 + 2.
+        if self.portfolio_risk is not None:
+            acquire = await self.portfolio_risk.try_acquire_for_entry(
+                symbol=self.config.symbol,
+                intended_qty=self.config.quantity,
+            )
+            if not acquire.granted:
+                # Audit "would-have-fired" event so calibration can see the
+                # alternative setup we passed on (decision 2: full
+                # observability of blocked entries).
+                await self.journal.record(
+                    "entry_blocked_by_portfolio_mutex",
+                    {
+                        "symbol": self.config.symbol,
+                        "intended_qty": self.config.quantity,
+                        "reason": acquire.reason,
+                        "current_holder": acquire.holder,
+                        "signal": {
+                            "kind": signal.kind.value,
+                            "ts": signal.ts.isoformat(),
+                            "price": signal.price,
+                            "reason": signal.reason,
+                            "extras": signal.extras or {},
+                        },
+                    },
+                )
+                self.strategy.mark_exited()
+                return
+            self._holds_portfolio_mutex = True
+
         # ---- Submit ----
         self.risk.record_open(self.config.quantity)
         self._entry_price = signal.price
@@ -629,11 +704,13 @@ class TradingEngine:
             quote_ticker=self._quote_ticker,
         )
         if trade is None:
-            # Submit failed - roll back state.
+            # Submit failed - roll back state (incl. mutex release: nothing
+            # opened, so no risk of double-holding).
             self.risk.record_close(realized_pnl_usd=0.0)
             self.strategy.mark_exited()
             self._entry_price = None
             self._entry_ts = None
+            await self._release_portfolio_mutex(realized_pnl_usd=0.0)
             return
 
         # Open the exit-trigger framework against a sensible stop suggestion.
@@ -712,6 +789,13 @@ class TradingEngine:
         # P&L tracked via fill callbacks (TODO once we wire realized pnl back).
         # For now we increment trades_count optimistically on full close.
         if qty >= held:
+            # Approximate realized P&L for portfolio-mutex accounting:
+            # (bar.close - entry_price) * qty. This is gross of commissions
+            # and uses the bar's close rather than the actual fill price, so
+            # it's only accurate enough for the daily kill switch, NOT for
+            # the trade journal. Per-trade fill-accurate P&L is tracked
+            # separately when we wire fill callbacks back (TODO).
+            approx_pnl = self._approx_realized_pnl(bar.close, held)
             self.risk.record_close(realized_pnl_usd=0.0)
             # Track whether this was a losing trade for the backside score.
             if self._entry_price is not None and bar.close < self._entry_price:
@@ -720,6 +804,7 @@ class TradingEngine:
             self._entry_ts = None
             self.exits.close()
             self.strategy.mark_exited()
+            await self._release_portfolio_mutex(realized_pnl_usd=approx_pnl)
 
     async def _handle_exit_signal(self, signal: Signal) -> None:
         """Legacy EXIT_LONG from a single-TF strategy (e.g. macd_crossover)."""
@@ -744,6 +829,7 @@ class TradingEngine:
             cancel_after_seconds=self.config.cancel_lmt_after_seconds,
             quote_ticker=self._quote_ticker,
         )
+        approx_pnl = self._approx_realized_pnl(signal.price, qty)
         self.risk.record_close(realized_pnl_usd=0.0)
         self._entry_price = None
         self._entry_ts = None
@@ -751,6 +837,7 @@ class TradingEngine:
             self.exits.close()
         if self.strategy is not None:
             self.strategy.mark_exited()
+        await self._release_portfolio_mutex(realized_pnl_usd=approx_pnl)
 
     # --- approval API (called from REST handler) ---
 
@@ -802,6 +889,35 @@ class TradingEngine:
             above_vwap=above_vwap,
             feature_snapshot=snap,
         )
+
+    # --- portfolio mutex helpers ---
+
+    async def _release_portfolio_mutex(self, *, realized_pnl_usd: float) -> None:
+        """Release the portfolio mutex if we currently hold it. Idempotent
+        and no-op when `portfolio_risk` is None (single-engine mode) or
+        when we never acquired it for this lifecycle. The realized P&L is
+        added to the portfolio's daily aggregate; when it pushes the
+        cumulative loss past the cap, the kill switch trips."""
+        if self.portfolio_risk is None or not self._holds_portfolio_mutex:
+            return
+        try:
+            await self.portfolio_risk.release(
+                symbol=self.config.symbol,
+                realized_pnl_usd=realized_pnl_usd,
+            )
+        finally:
+            self._holds_portfolio_mutex = False
+
+    def _approx_realized_pnl(self, exit_price: float, qty: int) -> float:
+        """Approximate realized P&L (gross of commissions) used by the
+        portfolio kill switch. Computed as `(exit_price - entry_price) *
+        qty` from the strategy's tracked entry price and the bar / signal
+        exit price. NOT a substitute for fill-accurate P&L in the trade
+        journal — those will come from the IBKR fill callbacks once we
+        wire them. Returns 0.0 if entry price is unknown."""
+        if self._entry_price is None:
+            return 0.0
+        return (exit_price - self._entry_price) * float(qty)
 
     # --- DB helpers ---
 

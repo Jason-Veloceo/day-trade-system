@@ -42,19 +42,24 @@ class EngineAlreadyRunningError(RuntimeError):
     engine first, or use Drop-and-Replace."""
 
 
-EngineFactory = Callable[[EngineConfig], TradingEngine]
+EngineFactory = Callable[[EngineConfig, PortfolioRiskGate], TradingEngine]
 """Factory function injected for testability. Production wires the
 default factory which uses `get_ibkr_client()` / `get_broker()` /
-`get_settings()`. Tests inject a mock factory that returns lightweight
-fake engines without needing IBKR."""
+`get_settings()` and threads the registry's `PortfolioRiskGate` into
+the engine constructor so the engine consults the mutex on every entry.
+Tests inject a mock factory that returns lightweight fake engines
+without needing IBKR; the test factory may also ignore portfolio_risk."""
 
 
-def _default_engine_factory(cfg: EngineConfig) -> TradingEngine:
+def _default_engine_factory(
+    cfg: EngineConfig, portfolio_risk: PortfolioRiskGate
+) -> TradingEngine:
     return TradingEngine(
         config=cfg,
         ibkr=get_ibkr_client(),
         broker=get_broker(),
         settings=get_settings(),
+        portfolio_risk=portfolio_risk,
     )
 
 
@@ -175,7 +180,7 @@ class EngineRegistry:
                 require_5m_macd=require_5m_macd,
                 dtd_context=dict(dtd_context or {}),
             )
-            engine = self._engine_factory(cfg)
+            engine = self._engine_factory(cfg, self._portfolio_risk)
             run_id = await engine.start()
             self._engines[symbol] = engine
             logger.info(

@@ -102,7 +102,7 @@ def _build_registry(
         max_daily_loss_usd=max_daily_loss,
     )
     return EngineRegistry(
-        engine_factory=lambda cfg: FakeEngine(cfg),
+        engine_factory=lambda cfg, _risk: FakeEngine(cfg),
         portfolio_caps=caps,
     )
 
