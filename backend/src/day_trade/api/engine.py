@@ -45,6 +45,56 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/engine", tags=["engine"])
 
 
+def _apply_microstructure_overrides(
+    strategy_name: str,
+    strategy_params: dict[str, Any],
+    require_5m_macd: bool,
+    overrides: MicrostructureIn | None,
+) -> dict[str, Any]:
+    """Return a copy of `strategy_params` with any user-supplied
+    microstructure overrides materialised into a `TrendGateConfig`
+    instance under the `"trend"` key.
+
+    Only applies to `first_pullback_long` (other strategies don't accept
+    a `trend` kwarg). Fields left as `None` on `overrides` fall through
+    to the strategy's built-in defaults.
+
+    The `require_5m_macd` flag is folded into the same `TrendGateConfig`
+    so the two configuration paths compose correctly (previously the
+    engine's __init__ handled `require_5m_macd=False` via a separate
+    fallback that we would otherwise silently skip once `"trend"` is
+    already populated).
+    """
+    result = dict(strategy_params)
+    if strategy_name != "first_pullback_long":
+        return result
+
+    override_dict: dict[str, Any] = {}
+    if overrides is not None:
+        override_dict = overrides.model_dump(exclude_none=True)
+
+    # No user overrides -> leave strategy_params untouched and let the
+    # engine's own __init__ handle the require_5m_macd fallback as
+    # before. This keeps auto-armed engines (which never send an
+    # overrides block) on the strategy defaults, and preserves any
+    # explicit `trend` a caller might have stuffed into
+    # `strategy_params` directly.
+    if not override_dict:
+        return result
+
+    # Local import to avoid a top-level dependency on the strategies
+    # package (keeps the API module cheap to import).
+    from day_trade.engine.strategies.first_pullback_long import TrendGateConfig
+
+    kwargs: dict[str, Any] = {
+        "require_5m_histogram_positive": require_5m_macd,
+        "require_5m_histogram_not_falling": require_5m_macd,
+    }
+    kwargs.update(override_dict)
+    result["trend"] = TrendGateConfig(**kwargs)
+    return result
+
+
 # ---------- request / response schemas ----------
 
 
@@ -53,6 +103,48 @@ class RiskCapsIn(BaseModel):
     max_position_value_usd: float = Field(5000.0, gt=0, le=1_000_000)
     max_position_qty: int = Field(25_000, ge=1, le=10_000_000)
     max_daily_loss_usd: float = Field(150.0, gt=0, le=100_000)
+
+
+class MicrostructureIn(BaseModel):
+    """Optional per-engine overrides for the entry-time microstructure gate.
+
+    Applies only to `first_pullback_long`. All fields are optional; anything
+    left unset falls through to the strategy's built-in defaults (see
+    `TrendGateConfig`). Ignored by other strategies.
+
+    Rationale for exposing this per-engine (as opposed to the Stage-1
+    Filter Rules which govern candidate selection): the microstructure
+    gate is evaluated at every tick against live L2/T&S, and different
+    price bands / setups warrant different thresholds. Auto-armed engines
+    use the defaults; manual arms can override on a case-by-case basis.
+    """
+
+    # Price-tiered spread caps (bps of mid). Basis-points scale is
+    # deliberately wide because 5c on a $2.50 stock is 200 bps and Ross
+    # still trades it.
+    max_spread_bps: float | None = Field(
+        default=None, ge=1.0, le=1000.0,
+        description=">= $20 spread cap in bps (default 50).",
+    )
+    max_spread_bps_under_5: float | None = Field(
+        default=None, ge=1.0, le=1000.0,
+        description="Sub-$5 spread cap in bps (default 200).",
+    )
+    max_spread_bps_under_20: float | None = Field(
+        default=None, ge=1.0, le=1000.0,
+        description="$5-$20 spread cap in bps (default 100).",
+    )
+
+    # L2 / T&S balance gates. 0..1 is the natural range (share of bid
+    # size, share of buy prints).
+    min_bid_ask_imbalance: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description="Min bid share of top-of-book size (default 0.45).",
+    )
+    min_tape_buy_pct: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description="Min buy % of last 60s prints (default 0.45).",
+    )
 
 
 class DtdContextIn(BaseModel):
@@ -100,6 +192,11 @@ class StartIn(BaseModel):
     # warmed up (needs ~26 5m bars = ~130 minutes of trading history).
     require_5m_macd: bool = True
     dtd_context: DtdContextIn = Field(default_factory=DtdContextIn)
+    # Optional per-engine microstructure overrides. When None (default),
+    # the strategy uses its built-in TrendGateConfig defaults - which is
+    # what auto-armed engines get. Manual arms may override individual
+    # fields via this block.
+    microstructure: MicrostructureIn | None = None
 
 
 class StartOut(BaseModel):
@@ -282,11 +379,17 @@ async def start(body: StartIn) -> StartOut:
         max_position_qty=body.risk_caps.max_position_qty,
         max_daily_loss_usd=body.risk_caps.max_daily_loss_usd,
     )
+    strategy_params = _apply_microstructure_overrides(
+        strategy_name=body.strategy_name,
+        strategy_params=body.strategy_params,
+        require_5m_macd=body.require_5m_macd,
+        overrides=body.microstructure,
+    )
     try:
         run_id = await registry.start(
             symbol=body.symbol,
             strategy_name=body.strategy_name,
-            strategy_params=body.strategy_params,
+            strategy_params=strategy_params,
             quantity=body.quantity,
             autonomous=body.autonomous,
             risk_caps=caps,

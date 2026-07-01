@@ -133,6 +133,14 @@ class EngineConfig:
     # and where L2 distress should bail before the minute is up. Set to
     # 0 to disable tick evaluation (legacy 1m-only behaviour).
     eval_tick_seconds: float = 10.0
+    # If enable_depth=True and the L2 book has not populated a
+    # best_bid/best_ask within this many seconds after arm, auto-stop
+    # the engine with reason="no_l2_depth_after_arm". IBKR permits only
+    # 3 concurrent reqMktDepth subscriptions per session, so a 4th
+    # engine silently ends up with an empty book — and no microstructure
+    # gate can pass without bid/ask. Rather than tie up the slot, we
+    # free it. Set to 0 to disable the watchdog.
+    depth_watchdog_seconds: float = 15.0
     dtd_context: dict[str, Any] = field(default_factory=dict)
 
 
@@ -198,6 +206,16 @@ class TradingEngine:
         self._pending_entry: _PendingEntry | None = None
         self._stop_event = asyncio.Event()
         self._running_task: asyncio.Task | None = None
+
+        # Watchdog task that auto-stops the engine if we asked IBKR for
+        # L2 depth (enable_depth=True) but no bid/ask ever populates
+        # within a configurable warm-up window. Motivating case: IBKR
+        # limits us to 3 concurrent reqMktDepth subscriptions per
+        # session; a 4th arm silently gets rejected (code=309), leaving
+        # the engine with an empty book and no way to evaluate the
+        # microstructure gate. Rather than tie up a slot forever, we
+        # free it so the next scanner alert can use it.
+        self._depth_watchdog_task: asyncio.Task | None = None
 
     @property
     def status(self) -> str:
@@ -351,7 +369,67 @@ class TradingEngine:
         )
         self.feed.start()
 
+        # Watchdog: if the caller asked for L2 depth but the subscription
+        # never delivers a bid/ask (IBKR silently rejects the 4th+
+        # depth request in a session — see EngineConfig docstring), free
+        # the slot rather than tie it up. Skipped when the caller didn't
+        # ask for depth in the first place, or when the timeout is
+        # explicitly disabled (0).
+        if self.config.enable_depth and self.config.depth_watchdog_seconds > 0:
+            self._depth_watchdog_task = asyncio.create_task(
+                self._depth_watchdog_run(self.config.depth_watchdog_seconds)
+            )
+
         return run_id
+
+    async def _depth_watchdog_run(self, timeout_seconds: float) -> None:
+        """After `timeout_seconds` post-arm, verify the L2 book has
+        produced at least one bid AND at least one ask. If not, journal
+        a structured `error` event and stop the engine with reason
+        `no_l2_depth_after_arm` so the slot is freed.
+
+        Robust to normal shutdown: if the engine is stopped before the
+        window elapses, the task is cancelled by `stop()` and no
+        journaling happens.
+        """
+        try:
+            await asyncio.sleep(timeout_seconds)
+        except asyncio.CancelledError:
+            return
+
+        if self._stop_event.is_set():
+            return
+        if self.market_state is None:
+            return
+
+        bb = self.market_state.depth.best_bid
+        ba = self.market_state.depth.best_ask
+        if bb is not None and ba is not None:
+            return
+
+        if self.journal is not None:
+            await self.journal.record(
+                "error",
+                {
+                    "kind": "no_l2_depth_after_arm",
+                    "where": "depth_watchdog",
+                    "timeout_seconds": timeout_seconds,
+                    "best_bid": bb.price if bb is not None else None,
+                    "best_ask": ba.price if ba is not None else None,
+                    "msg": (
+                        "L2 depth subscription never populated bid/ask "
+                        "after arm — likely IBKR concurrent-depth limit "
+                        "(error 309) or missing entitlement for this "
+                        "listing venue. Freeing the engine slot."
+                    ),
+                },
+            )
+        logger.warning(
+            "engine %s: depth watchdog fired (no bid/ask after %.1fs); stopping",
+            self.spec.display if self.spec else "?",
+            timeout_seconds,
+        )
+        await self._stop_from_error("no_l2_depth_after_arm")
 
     async def _bootstrap_indicators(self, contract: Contract) -> None:
         """Pull recent 1m historical bars and replay them into the strategy
@@ -476,6 +554,15 @@ class TradingEngine:
         if self._stop_event.is_set():
             return
         self._stop_event.set()
+
+        # Cancel the depth watchdog if it's still pending — this stop()
+        # may itself be the watchdog firing, so skip cancelling our
+        # own task (which would raise from inside the same task).
+        if self._depth_watchdog_task is not None:
+            current = asyncio.current_task()
+            if self._depth_watchdog_task is not current and not self._depth_watchdog_task.done():
+                self._depth_watchdog_task.cancel()
+            self._depth_watchdog_task = None
 
         if self.feed is not None:
             self.feed.stop()

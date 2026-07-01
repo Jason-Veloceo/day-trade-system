@@ -511,64 +511,438 @@ happened to have fresh enough backlog* (EEIQ was armed correctly,
 then killed by the bug we then fixed in #4a), but it's not yet a
 stable scanner-driven auto-arm loop in steady state.
 
-### Tomorrow's plan (priority order)
+### Wed 1 Jul PM session — live-channel SOLVED, auto-arm hardened, first paper fill on TC, no full-cycle Ross trade yet
 
-1. **Pin the live channel.** Premarket / open. Stop any orphan
-   Chromium first (`ps aux | grep -i chromium | grep day-trade`,
-   kill if any). Then:
-   ```
-   cd backend && uv run python ../scripts/dtd_diagnose_ws.py
-   ```
-   When Chromium opens, click through to the actual Momo scanner
-   widget popup and leave it visible. The 120s capture will record
-   every HTTP request (incl. pending long-polls), every WS frame,
-   and save full `/alert` bodies to
-   `playwright_profile/_inspect/alert_bodies/`. Inspect the tail of
-   the Momo body to confirm whether it contains recent (last-60s)
-   events — that decides whether `/alert` is the live channel
-   (just polled rarely) or whether we need a new endpoint.
-2. **Patch `DtdObserver`** to listen on whatever the real live
-   channel turns out to be (long-poll URL, popup-specific endpoint,
-   or a `/v2/alerts/stream` style SSE we haven't seen yet).
-3. **Add a watchdog** to the observer: if `last_event_age_seconds >
-   90` while the process is alive, log a `WARN` and (optional)
-   auto-restart the Playwright context. Prevents the silent-failure
-   mode we hit twice today.
-4. **Resume original pending list** (below) once the live-channel
-   fix is in.
+Long US-premarket / early-RTH session on ports 8010/3010. Live-channel
+mystery is closed, the auto-arm loop is now stable end-to-end, and
+several trades were **evaluated** by the full gate stack. Only one
+actually opened a position (**TC**) and it was a small paper loss
+manually exited. No successful full-cycle Ross-style trade yet — this
+is the primary focus for tomorrow's full RTH session.
+
+**1. 🟢 Live-channel mystery SOLVED — SharedWorker + Socket.IO
+interception (shipped + tested).**
+
+Warrior Trading's dashboard doesn't poll `/alert` and doesn't use a
+top-level WebSocket. Live scanner updates arrive via a **`SharedWorker`
+running a Socket.IO client** that multiplexes streams into the main
+page via `postMessage`. Playwright's default listeners see neither
+the SharedWorker traffic nor its message payloads.
+
+Fix: a JavaScript `_INIT_SCRIPT` that monkey-patches `window.Worker`
+and `window.SharedWorker` in the page context, hooks every
+`postMessage` / `onmessage` / `addEventListener("message")` path, and
+bridges the payloads back to Python via
+`context.expose_function("_dispatch", ...)`.
+
+New module `backend/src/day_trade/ingest/dtd/shared_worker.py`
+(`SharedWorkerInterceptor`) owns the init-script and the Python-side
+dispatch. `DtdObserver` was refactored for **dual ingestion**: the
+socket stream is primary (real-time), the existing `/alert` HTTP
+listener is retained as a backfill / warm-start path.
+
+Verified live during the session: Momo and Running_Up socket frames
+arrive within a second of the WT UI showing them. Debug-monitor task
+we spun up recorded 828+ Momo `src=socket` events flowing steadily
+across the session.
+
+Related fixes: Playwright profile corruption (recreated from scratch);
+`dtd_login.py` `wait_for_event("close", timeout=0)` hang (worked
+around by manually logging in inside the observer's own Chromium
+window so the session lives in the observer's context).
+
+Tests: `test_dtd_shared_worker.py` covers dispatch classification
+(alert-body vs junk vs error frames) and `DtdObserver._ingest_alert_body`.
+
+**2. Auto-arm robustness — asymmetric-staleness fix + cooldown
+decoupling (shipped + tested).**
+
+Bug: **TC engine armed and killed 7 minutes later** with reason
+`candidate_disappeared`. Root cause was a two-layer asymmetry:
+
+1. **`decide()`** consulted the aggregate `Candidate.last_alert_at`
+   (kept fresh by ANY configured widget), while `is_engine_stale()`
+   only checked **widget-specific** freshness. So a candidate could
+   arm on aggregate freshness and immediately fail the widget-specific
+   staleness check.
+2. `Candidate.cooldown_until` was set to `first_alert_at + 10min` and
+   never extended by subsequent alerts. Live candidates fell out of
+   the auto-arm view once cooldown expired, even when scanner events
+   were still fresh.
+
+Fixes:
+- New `CandidateView.widget_specific_last_alert_at` populated by
+  querying `scanner_events` directly (not `Candidate.cooldown_until`).
+- Both `decide()` and `is_engine_stale()` now use widget-specific
+  freshness for symmetric arm/stale decisions.
+- `is_engine_stale()` also skips staleness entirely when
+  `engine.has_open_position` is True — a filled engine must never be
+  killed by the scanner watchdog.
+- `AutoArmWorker._fetch_active_engines` treats `_pending_entry is not
+  None` as "has_open_position" so an in-flight BUY between submit and
+  fill isn't classified as idle.
+- New `AUTO_ARM_LOOKBACK_SECONDS` (90s) and `AUTO_ARM_GRACE_PERIOD_SECONDS`
+  (120s) settings — a candidate must be fresh AND newly-armed engines
+  get a grace period before staleness can fire (independent bug from
+  the "armed-and-killed-in-12s" fix landed Tue 30 Jun).
+
+Tests: `test_auto_arm_policy.py` grew to 31 tests (up from 26);
+5 new tests covering widget-specific freshness, 3 updated for the
+new fields, 4 new tests around the grace period.
+
+**3. Microstructure gate calibration for small caps (shipped + tested).**
+
+User observation on CANF: 5c spread on a $2.55 stock (196 bps) was
+being rejected by the flat `max_spread_bps=50` cap, despite Ross
+trading exactly this kind of setup. **Price-tiered thresholds** now:
+
+| Price band | `max_spread_bps` |
+|---|---|
+| `< $5`   | 200 (5-10c spread OK on penny-tier movers) |
+| `< $20`  | 100 (default $5-$20 band) |
+| `>= $20` | 50  (tight on large caps)  |
+
+Selection is done by a new `_max_spread_bps_for_price(price)` helper.
+Fallback is the **tightest** (50 bps) when price is unknown — safer to
+skip a trade than to enter with no snapshot.
+
+Also relaxed `min_bid_ask_imbalance` and `min_tape_buy_pct` from 0.55
+to **0.45** for aggressive small-cap trading. 0.45 still rejects
+clearly-lopsided sell pressure (e.g. LHAI's 0.14 imbalance drop
+that we saw live), while 0.55 was blocking legitimate breakouts on
+choppy tape.
+
+Tests: 17 new tests in `test_engine_microstructure.py` covering tier
+boundaries, price-fallback, and the relaxed floors. Regression test
+for the specific 5c-on-$2.55 scenario.
+
+**4. Per-engine microstructure override on the Arm form (shipped + tested).**
+
+Follow-up ask after the calibration above: "should we have this as a
+setting in the rules?" Filter Rules (Stage 1) govern candidate
+selection (news / float / rel-vol); microstructure is Stage 2
+(entry-time L2/T&S). Different data, different cadence — so instead
+of adding to Filter Rules, added a collapsible **"Advanced:
+microstructure overrides (optional)"** section to the Arm form with
+5 fields (spread caps for each tier + imbalance + tape%). Blank =
+use defaults; auto-armed engines always use defaults.
+
+Backend: new `MicrostructureIn` schema on `StartIn`, and a pure
+`_apply_microstructure_overrides()` helper that composes overrides
+with the `require_5m_macd` toggle into a `TrendGateConfig`.
+
+Tests: 14 focused tests in `test_api_engine_start_overrides.py`
+covering pass-through, non-`first_pullback_long` no-op, single/multi
+override composition, `require_5m_macd` fold-in in both positions,
+input-dict non-mutation, and pydantic range validation.
+
+**5. IBKR order-rejection visibility + auto-stop on permanent errors
+(shipped + tested).**
+
+Bug caught live: JEM order rejected by IBKR with
+`"closing-only status"` — the engine only recorded `Inactive` status
+and kept retrying every subsequent bar. IBKR's actual human-readable
+error text arrives on `errorEvent`, which the engine wasn't listening
+to per-order.
+
+Fix:
+- New per-order error dispatcher in `IBKRClient` — binds once to
+  `errorEvent`, filters info codes, routes each order-specific error
+  to registered handlers.
+- Classification tables (`_PERMANENT_ORDER_ERROR_PATTERNS`,
+  `_IBKR_INFO_CODES`) and `is_permanent_symbol_error()` helper.
+- On order submit, `_handle_enter` registers a handler that journals
+  the full IBKR message as an `error` event with
+  `kind=ibkr_order_error` and, if classified permanent, calls
+  `_stop_from_error()`.
+- Handler is unregistered on terminal order status.
+
+Also fixed: `entry_cancelled_without_fill` and `entry_promoted` were
+not valid DB enum values, causing silent journal failures. Both are
+now routed through the `error` and `position_open` DB event types
+with a `kind` field in the payload for discrimination.
+
+Tests updated in `test_engine_portfolio_integration.py`.
+
+**6. TC orphaned-position race condition fix (shipped + regression
+test).**
+
+Very close call: TC's order filled successfully at $5.36, but the
+engine stopped 7 seconds later, leaving an unmonitored open position.
+Root cause: race between `_on_entry_status(Filled)` and
+`_on_entry_fill`. Whichever fired first cleared `_pending_entry`;
+the second handler then bailed early, so `risk.record_open()` was
+never called and `open_position_qty` stayed at 0. The auto-arm
+watchdog then classified the engine as idle and killed it.
+
+Fix:
+- `_on_entry_fill` now calls `risk.record_open(filled)` FIRST, before
+  touching `_pending_entry`. Position size is registered immediately.
+- `_pending_entry` cleared only inside `_on_entry_fill` (after
+  promotion) — `_on_entry_status(Filled)` no longer touches it.
+- `AutoArmWorker._fetch_active_engines` treats `_pending_entry` as
+  "position open" too, so an order between submit and fill can't be
+  killed either.
+- New regression test:
+  `test_status_filled_before_fill_event_does_not_orphan_position`.
+
+**7. L2 depth watchdog — auto-drop engines with no live features
+(shipped + tested).**
+
+User observation this session: several engines were arming with the
+L2 side blank (bid/ask/spread/mid all `—` in the UI, though tape and
+imbalance defaulted to 50%). Root cause: **IBKR caps concurrent
+`reqMktDepth` subscriptions at 3 per session** (`code=309 Max number
+(3) of market depth requests has been reached`). Any 4th arm gets
+silently rejected and its book stays empty — with no bid/ask the
+microstructure gate can't evaluate, so the slot is wasted.
+
+Fix: new `EngineConfig.depth_watchdog_seconds` (default **15s**).
+`start()` spawns an async watchdog task; if the engine has
+`enable_depth=True` and `market_state.depth.best_bid`/`best_ask` is
+still `None` after the timeout, it journals an `error` event with
+`kind=no_l2_depth_after_arm` and stops itself with the same reason.
+Cancels cleanly on normal stop. Set the config to 0 to disable.
+
+Tests: 6 tests in `test_engine_depth_watchdog.py` covering the drop
+path, no-op when the book populates in time, no-op when engine
+already stopped, cancellation semantics, and half-populated books
+(bid-only or ask-only both count as "no depth").
+
+**8. `EngineChart` "Cannot update oldest data" crash fix (shipped).**
+
+Frontend chart was crashing when a live `indicator` (or occasionally
+`bar_tick`) event arrived with a timestamp older than what was
+already plotted post-historical `setData()`. `lightweight-charts`'
+`.update()` treats older timestamps as an error.
+
+Fix: high-watermark tracking in `EngineChart.tsx` — `lastCandleTimeRef`
+and `lastIndicatorTimeRef` seeded from the historical seed, updated
+on every successful append. Strictly-older events are dropped
+silently; equal-timestamp events (revisions to the current bar/tick)
+still update. No more chart crashes seen after the fix.
+
+**9. Auto-arm default made autonomous (fixed live, persisted in .env).**
+
+Live catch: **JEM signal parked at `READY_FOR_APPROVAL`** despite
+`autonomous=true` being the intended default for auto-armed engines.
+Root cause: `Settings.auto_arm_autonomous = False` in `config.py`
+and never overridden in `.env`. The intended `True` default from the
+earlier session had never actually been wired.
+
+Fix:
+- `.env` now has `AUTO_ARM_ENABLED=true`, `AUTO_ARM_AUTONOMOUS=true`,
+  `AUTO_ARM_MAX_PER_HOUR=0`, `AUTO_ARM_MAX_PER_DAY=0`,
+  `AUTO_ARM_REARM_COOLDOWN_MINUTES=0`. (Rate limits at 0 = unlimited;
+  microstructure gate + risk caps do the filtering instead of a
+  hard-count throttle.)
+- Runtime `PATCH /auto_arm/config` now supports `autonomous`,
+  `max_per_hour`, `max_per_day`, and `rearm_cooldown_minutes` for
+  in-process overrides without a restart.
+- `autonomous` is now visible on `GET /auto_arm/status` so this
+  misconfiguration doesn't hide silently in the future.
+
+**10. What was actually traded today (paper account DUM733674).**
+
+The Warrior scanners were quiet for most of the session (post-open
+tape thinned out around 10:30 ET AM). Auto-arm evaluated dozens of
+candidates on both `Momo` and `Running_Up`; the gate stack rejected
+most of them for the right reasons:
+
+- **CANF** — auto-armed on Running_Up, microstructure gate correctly
+  rejected on `bid:ask imbalance 0.40 < 0.45`. Ross also took CANF
+  around the same time and got out for a small profit — user
+  confirmed it wasn't a good trade. Gate call was right.
+- **LHAI** — auto-armed on Running_Up, structural trigger fired
+  three times at $1.5199 (visible as stacked BUY arrows on chart),
+  microstructure rejected each attempt on imbalance. LHAI then
+  dropped to $1.40, then partially recovered to $1.46 — gate call
+  correctly avoided a chop trade.
+- **TC** — auto-armed on Running_Up. **Actually filled**:
+  BUY LMT @ $5.39 → filled @ $5.36 (100 shares). Held briefly,
+  price rolled over, exited manually at $5.33 = **paper -$5.03**
+  (before commission). This was the only position that actually
+  opened during the session. The engine was armed with
+  `autonomous=False` (the misconfiguration in #9 above), so we had
+  to click Approve on the entry — which we did in time, unlike JEM.
+- **JEM** — order attempts hit IBKR with `LMT 8.14`, `9.15`, and
+  `9.78`; all three rejected with **"closing-only status"** (JEM
+  was flagged for closing-only trades that session). The engine
+  now journals this correctly and would auto-stop on the permanent
+  error — but the fix from #5 was landing during this exact flow,
+  so behaviour on-the-day was still retry-and-retry. Also
+  demonstrated the stale-approval concern: user clicked Approve on
+  a signal after the ticker had already gone stale, and the engine
+  fired the order at the current LMT anchor rather than rejecting
+  the approval.
+
+**No successful full-cycle Ross-style trade in the session.** TC is
+the only entry-to-exit round-trip and it was a small loss with a
+manual exit, not a strategy-driven scale-out.
+
+**Test summary at session end: 232 / 232 passing** (up from 177 at
+Tuesday's close; ~55 new tests today across auto-arm robustness,
+microstructure, API overrides, IBKR error handling, depth watchdog,
+and the fill race regression).
+
+**11. Ops notes from the session (worth remembering).**
+
+- **Cursor Shell tool aggressively reaps backgrounded processes** —
+  even with `nohup ... & disown` the uvicorn process died after
+  ~2 minutes. `setsid` doesn't exist on macOS. **Working recipe**
+  for a session-independent background process is a full
+  **double-fork daemonize via `python3`** (new session with
+  `os.setsid()`, `os.umask(0)`, `dup2` stdout/stderr to log file,
+  `os.execvp`). Kept in a shell snippet — pull it out if we ever
+  need to restart the backend from an agent-controlled shell again.
+- **Backend restart workflow to pick up `.env` changes**: `uvicorn
+  --reload` watches Python files only. To pick up `.env`, kill the
+  uvicorn parent (`kill -TERM <pid>`), wait for port 8010 to free,
+  then re-run in your normal terminal.
+- **Playwright `SharedWorker` interception surface** is *very*
+  restrictive — the only reliable path is the JS init-script route
+  we now use. Do not try to `page.on("worker", ...)` or CDP-hook
+  SharedWorker directly; both are silently no-op'd on Chromium
+  builds we care about.
+
+### Tomorrow's plan (priority order) — Thu 2 Jul, full US RTH session
+
+Focus this session is **the trading side**. Ingestion, auto-arm, and
+gate calibration are stable enough that we should just let it run
+for a full session and see how the entry/exit framework performs on
+live movers. Do not spend time on ingestion follow-ups unless they
+break — everything on that front from tomorrow is nice-to-have.
+
+**0. Boot checklist (do this before touching anything).**
+
+```
+# Backend (in a persistent user terminal, NOT via an agent shell):
+cd backend && uv run uvicorn day_trade.app:app --host 127.0.0.1 --port 8010 --reload
+
+# Frontend:
+cd frontend && npm run dev -- --port 3010
+
+# Then in the /engine UI:
+#   - Click "Start observer" on the DTD Observer bar.
+#   - Confirm Chromium lands on the WT chatroom (should carry the
+#     session from last night; if it lands on `no-access`, run
+#     scripts/dtd_login.py once and log in inside THAT window).
+#   - Verify GET /auto_arm/status shows { enabled: true, autonomous: true,
+#     max_per_hour: 0, max_per_day: 0, rearm_cooldown_minutes: 0 }.
+#   - Verify GET /engine/status shows slots.active_engines <= 3
+#     (see #1 below — the IBKR depth cap effectively limits us to 3).
+```
+
+**1. Let auto-arm run the whole session and observe.**
+
+The scanners + auto-arm loop are stable. Don't intervene unless
+something breaks. Watch for:
+
+- **Full-cycle trades**: entry → exit driven by the strategy, not by
+  manual click. That's the missing data point.
+- **Depth watchdog firing** (`kind=no_l2_depth_after_arm`) — should be
+  the norm on the 4th concurrent arm, since IBKR only allows 3
+  depth subscriptions. Slot should free within 15s and the next
+  candidate should grab it. If we see this NOT firing (or an engine
+  hanging with no L2 for >30s) something is wrong.
+- **IBKR permanent-error auto-stops** (`kind=ibkr_order_error`,
+  `permanent=true`) — should stop the engine cleanly, no retry loop.
+- Any `error` events in the audit log — inspect them, don't just
+  scroll past. New categories to watch for after today's changes.
+
+**2. If we get a full-cycle trade — measure it against Ross's playbook.**
+
+For any trade that entry-to-exits without manual intervention:
+
+- Was the entry timing correct? (Same bar Ross would have entered on?)
+- Was the exit driven by which trigger? (`hard_stop`, `first_target`,
+  `second_target`, `l2_distress`, `tape_flip`, `time_stop`, `macd_flip`,
+  `vwap_loss`) — anything ending in `_target` is the fixed-R exit
+  we know needs to be replaced. `_distress` / `_flip` are the right
+  primitives but they only *fire when a move is failing*, they don't
+  scale out into strength.
+- Would Ross have held longer? Sold sooner? Note the diff.
+
+**3. Only if the trading side is broken or the market is dead:**
+
+- **Ross-style dynamic exit framework redesign** (biggest known gap —
+  see "THE NEXT BIG SLICE" section further down). This is the
+  natural next feature once we've watched enough trades to see the
+  current exit primitives fire.
+- **Item 3 — Scaled entry (3-rung LMT ladder + scale-in).** Ross
+  scales in as the trade confirms; we're all-in on trigger. Replace
+  the single-LMT submission with a 3-rung ladder. Estimated 1-2 days.
+- **Capture qualified-contract metadata** (company name / primary
+  exchange / secType) into the bootstrap event + engine header.
+  Small win, 1-2 hours.
+
+**Do NOT** re-open live-channel work (solved), auto-arm gate work
+(stable), microstructure calibration (tuned + configurable now), or
+observer UI (works). If any of those regress, fix in place — don't
+rebuild.
 
 ### Open follow-ups (pick up here)
 
-Last session ended Tue 30 Jun ~23:20 Perth.
-Servers stopped, repo pushed. **Auto-arm v1, 10s tick cadence,
-typed gate failures, observer UI control all shipped.** Live-channel
-mystery for the DTD observer is the immediate blocker (see "Tomorrow's
-plan" above).
+Last session ended Wed 1 Jul ~22:50 Perth (mid US RTH, Wed).
+Servers stopped, repo pushed. **Live-channel solved, auto-arm
+stable, microstructure calibrated, per-engine override on the Arm
+form, IBKR error handling + depth watchdog + fill race fixes all
+shipped.** 232 / 232 tests passing. **The trading loop is now
+ready for a full session evaluation** — Thursday's job is to observe
+entry/exit behaviour end-to-end.
 
-**Carry-overs (still open from previous sessions + this one):**
+**Immediate (this week):**
 
-- **Capture qualified-contract metadata** — `qualifyContracts()`
-  returns company name / primary exchange / secType but we don't
-  persist these. User asked for this so the engine header shows
-  "AIRJ — Air Industries Group (NASDAQ)" instead of just `AIRJ`,
-  to confirm we're not accidentally on the wrong instrument.
-  Estimated 1-2 hours.
-- **DECISION NEEDED — relax microstructure thresholds.** Default
-  `max_spread_bps=50`, `imbalance_floor=0.55`, `tape_buy_pct_floor=0.55`
-  are too tight for wide-spread small-caps like AIRJ. Either lower
-  the defaults or make them per-symbol overrideable from the Arm
-  form. User-side decision pending. Estimated 0.5 day.
+- **Ross-style dynamic exit framework redesign.** Surfaced Fri 26 Jun
+  by ILLR run #25, still open. Current `exits.py` fires fixed-R
+  targets ahead of any dynamic trigger — we need dynamic-first (L2
+  wall detection, absorption, tape-side scale-outs) and fixed-R as
+  last-resort. See the **"Ross-style exit redesign"** section
+  below for the full design brief. **Blocked pending a few full-cycle
+  observations** — need to see the current exits fire on real trades
+  before rewriting them. Estimated 3-5 days once unblocked.
 - **Item 3 — Scaled entry (3-rung LMT ladder + scale-in).** Ross
   scales in on confirmation, not all-in on the trigger. Replace the
   current single-LMT submission with a 3-rung ladder
   (entry, +N cents, +2N cents) and a scale-in path when structure
   holds. Estimated 1-2 days.
-- **Item 4 — Verify the tick-level L2 monitor.** The 10s cadence
-  already routes `partial` bars through the exit framework
-  (including `l2_distress`), but we haven't end-to-end-verified
-  that continuous-depth updates from `reqMktDepth` actually drive
-  evaluation at every snapshot, not just at 10s ticks. ~1 day to
-  validate + fix if needed.
+- **Approval TTL (deferred but noted).** Signals parked at
+  `READY_FOR_APPROVAL` currently have no time-to-live: click Approve
+  30s later and the order fires with a re-computed LMT anchor. With
+  `autonomous=true` now the default for auto-armed engines this is
+  mostly moot, but manual arms via the form still default to
+  `autonomous=False` and can hit it. Options captured on Wed 1 Jul:
+  add a 30s TTL, or 15s TTL + re-run microstructure gate at approval
+  time. Deferred — pick up if it bites on a manual arm.
+
+**Smaller / opportunistic:**
+
+- **Capture qualified-contract metadata** (company name / primary
+  exchange / secType) into the bootstrap event + engine header.
+  So "AIRJ" shows as "AIRJ — Air Industries Group (NASDAQ)" and we
+  can confirm we're not on the wrong instrument. ~1-2 hours.
+- **Item 4 — Verify the tick-level L2 monitor.** 10s cadence routes
+  partial bars through the exit framework (incl. `l2_distress`) but
+  we haven't verified continuous-depth updates from `reqMktDepth`
+  drive evaluation at every snapshot, not just at 10s ticks.
+  Naturally addressed as part of the exit framework redesign.
+- **Channel-health UI surface.** The socket/HTTP dual-ingestion is
+  invisible to the operator — surface which channel is delivering
+  events (last N minutes) on the DTD Observer bar. Would have made
+  the "is Momo actually flowing?" debugging session on Wed 1 Jul
+  much faster. ~2-3 hours.
+- **Polling watchdog for the DTD observer** (deprioritised — the
+  socket path is proven solid, so this is defensive against a
+  regression). If it ever comes up, add a check: if
+  `last_event_age_seconds > 90` and process alive, log WARN and
+  optionally auto-restart Playwright.
+
+**How to reproduce Wed 1 Jul's specific paper trade** (for regression
+comparison):
+
+- TC BUY @ 5.36, 100 shares, filled ARCA (paper account DUM733674).
+  Auto-armed via Running_Up scanner. Held ~3 min, manually exited
+  @ 5.33 = **-$5.03 before commission**. Only round-trip in the session.
 
 Earlier session entry below (kept for context).
 

@@ -160,6 +160,7 @@ class AutoArmWorker:
             "widgets": list(cfg.widgets),
             "window_et": f"{cfg.window_start_et.isoformat(timespec='minutes')}"
                           f"-{cfg.window_end_et.isoformat(timespec='minutes')}",
+            "autonomous": cfg.autonomous,
             "max_per_day": cfg.max_per_day,
             "max_per_hour": cfg.max_per_hour,
             "rearm_cooldown_minutes": cfg.rearm_cooldown_minutes,

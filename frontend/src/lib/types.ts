@@ -123,6 +123,17 @@ export interface GateFailure {
   message: string;
 }
 
+// Optional per-engine overrides for the entry-time microstructure gate
+// (first_pullback_long only). Unset fields fall through to the strategy
+// defaults; auto-armed engines never send this block.
+export interface EngineMicrostructureOverrides {
+  max_spread_bps?: number;
+  max_spread_bps_under_5?: number;
+  max_spread_bps_under_20?: number;
+  min_bid_ask_imbalance?: number;
+  min_tape_buy_pct?: number;
+}
+
 export interface EngineStartIn {
   symbol: string;
   strategy_name: string;
@@ -139,6 +150,7 @@ export interface EngineStartIn {
   enable_tape: boolean;
   require_5m_macd: boolean;
   dtd_context: EngineDtdContext;
+  microstructure?: EngineMicrostructureOverrides | null;
 }
 
 export interface EngineFeatureSnapshot {

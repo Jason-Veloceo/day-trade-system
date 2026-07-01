@@ -22,6 +22,7 @@ import type {
   EngineFeatureSnapshot,
   EngineGateFailureCategory,
   EnginePortfolioStatus,
+  EngineMicrostructureOverrides,
   EngineRegistryStatus,
   EngineRun,
   EngineSlotsStatus,
@@ -113,6 +114,7 @@ const DEFAULT_START: EngineStartIn = {
   enable_tape: false,
   require_5m_macd: true,
   dtd_context: DEFAULT_DTD,
+  microstructure: null,
 };
 
 export default function EnginePage() {
@@ -496,6 +498,12 @@ function buildReplacementStartIn(old: EngineStatus, newSymbol: string): EngineSt
     enable_tape: old.enable_tape ?? false,
     require_5m_macd: old.require_5m_macd ?? true,
     dtd_context: { ...DEFAULT_DTD },
+    // Drop-and-Replace resets microstructure overrides to defaults —
+    // the source engine's overrides live inside strategy_params.trend
+    // as an opaque object and are not reliably round-trippable here.
+    // If the user wants custom values on the replacement, they can
+    // Stop + Arm the new symbol manually.
+    microstructure: null,
   };
 }
 
@@ -1291,6 +1299,9 @@ function StartForm({
         </div>
       ) : null}
 
+      {/* Microstructure gate overrides (first_pullback only, collapsible) */}
+      {isFirstPullback ? <MicrostructureOverrideFields form={form} setForm={setForm} /> : null}
+
       {/* DTD context (only for first_pullback) */}
       {isFirstPullback ? <DtdContextFields form={form} setForm={setForm} /> : null}
 
@@ -1386,6 +1397,129 @@ function StartForm({
         {busy ? "Arming…" : "Arm engine"}
       </button>
     </form>
+  );
+}
+
+// Collapsible per-engine microstructure overrides. Any field left blank
+// (empty input) is sent as unset and the strategy uses its built-in
+// default. Auto-armed engines never send this block; only manual arms
+// via this form can tweak these values.
+function MicrostructureOverrideFields({
+  form,
+  setForm,
+}: {
+  form: EngineStartIn;
+  setForm: (s: EngineStartIn) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const micro = form.microstructure ?? {};
+
+  const setField = (key: keyof EngineMicrostructureOverrides, raw: string) => {
+    const value = raw.trim() === "" ? undefined : Number(raw);
+    if (value !== undefined && Number.isNaN(value)) return;
+    const next = { ...micro, [key]: value };
+    // If every field is unset, clear the block entirely so the request
+    // body stays clean.
+    const empty = Object.values(next).every((v) => v === undefined);
+    setForm({ ...form, microstructure: empty ? null : next });
+  };
+
+  return (
+    <div className="rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center justify-between text-left"
+      >
+        <span className="text-xs font-semibold text-neutral-600">
+          Advanced: microstructure overrides (optional)
+        </span>
+        <span className="text-xs text-neutral-500">{open ? "hide" : "show"}</span>
+      </button>
+      {open ? (
+        <div className="mt-3 space-y-3">
+          <div className="text-xs text-neutral-500">
+            Leave any field blank to use the strategy default. Applies only to
+            this engine — auto-armed engines always use the defaults.
+          </div>
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="Max spread bps (< $5)">
+              <input
+                type="number"
+                inputMode="decimal"
+                step="any"
+                min={1}
+                max={1000}
+                placeholder="200"
+                value={micro.max_spread_bps_under_5 ?? ""}
+                onChange={(e) => setField("max_spread_bps_under_5", e.target.value)}
+                className="w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-neutral-900 focus:outline-none"
+              />
+            </Field>
+            <Field label="Max spread bps ($5–$20)">
+              <input
+                type="number"
+                inputMode="decimal"
+                step="any"
+                min={1}
+                max={1000}
+                placeholder="100"
+                value={micro.max_spread_bps_under_20 ?? ""}
+                onChange={(e) => setField("max_spread_bps_under_20", e.target.value)}
+                className="w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-neutral-900 focus:outline-none"
+              />
+            </Field>
+            <Field label="Max spread bps (≥ $20)">
+              <input
+                type="number"
+                inputMode="decimal"
+                step="any"
+                min={1}
+                max={1000}
+                placeholder="50"
+                value={micro.max_spread_bps ?? ""}
+                onChange={(e) => setField("max_spread_bps", e.target.value)}
+                className="w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-neutral-900 focus:outline-none"
+              />
+            </Field>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Min bid/ask imbalance (0–1)">
+              <input
+                type="number"
+                inputMode="decimal"
+                step="any"
+                min={0}
+                max={1}
+                placeholder="0.45"
+                value={micro.min_bid_ask_imbalance ?? ""}
+                onChange={(e) => setField("min_bid_ask_imbalance", e.target.value)}
+                className="w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-neutral-900 focus:outline-none"
+              />
+            </Field>
+            <Field label="Min tape buy % (0–1)">
+              <input
+                type="number"
+                inputMode="decimal"
+                step="any"
+                min={0}
+                max={1}
+                placeholder="0.45"
+                value={micro.min_tape_buy_pct ?? ""}
+                onChange={(e) => setField("min_tape_buy_pct", e.target.value)}
+                className="w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-neutral-900 focus:outline-none"
+              />
+            </Field>
+          </div>
+          <Hint>
+            Spread tiers cover the full price range (5c on $2.55 = 196 bps —
+            legitimate on small caps, so the sub-$5 default is 200). Imbalance
+            and buy % run 0–1: 0.45 means at least 45% of top-of-book size on
+            the bid, and 45% of the last 60s of prints marked as buys.
+          </Hint>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

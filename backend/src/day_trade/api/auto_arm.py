@@ -29,6 +29,12 @@ class AutoArmStatusOut(BaseModel):
     enabled: bool
     widgets: list[str]
     window_et: str
+    # When True, engines armed by the worker are started with
+    # autonomous=True (signals fire directly, no approval gate).
+    # When False, auto-armed engines require the operator to click
+    # Approve on every parked signal — which is often too slow for
+    # Ross-style fast-pivot setups.
+    autonomous: bool
     max_per_day: int
     max_per_hour: int
     rearm_cooldown_minutes: int

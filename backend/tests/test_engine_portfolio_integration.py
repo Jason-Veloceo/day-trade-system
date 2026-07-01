@@ -234,6 +234,7 @@ def _build_engine(
     engine._pending_entry = None
     engine._stop_event = asyncio.Event()
     engine._running_task = None
+    engine._depth_watchdog_task = None
 
     return engine, journal, executor, portfolio_risk, strategy
 
