@@ -82,6 +82,25 @@ class EntryGateResult:
     notes: dict[str, Any] = field(default_factory=dict)
 
 
+def _max_spread_bps_for_price(cfg: "TrendGateConfig", price: float | None) -> float:
+    """Pick the appropriate spread tier for a reference price.
+
+    Ross-style: small caps get wide-relative-spread leeway, higher priced
+    names get tighter. Called at entry-time from the microstructure gate.
+
+    If `price` is None (no book / no bar yet) we fall back to
+    `cfg.max_spread_bps` — the tightest tier — so we don't accidentally
+    accept a wide-spread trade on an unknown price.
+    """
+    if price is None or price <= 0:
+        return cfg.max_spread_bps
+    if price < 5.0:
+        return cfg.max_spread_bps_under_5
+    if price < 20.0:
+        return cfg.max_spread_bps_under_20
+    return cfg.max_spread_bps
+
+
 @dataclass(frozen=True, slots=True)
 class TrendGateConfig:
     require_5m_histogram_positive: bool = True
@@ -97,10 +116,26 @@ class TrendGateConfig:
     require_1m_trigger: bool = True
 
     # Microstructure (entry-time only)
+    #
+    # Spread is tiered by price. Small caps under $5 legitimately have
+    # wider *relative* spreads (5c on $2.55 = 196 bps) but Ross still
+    # trades them — the earlier flat 50 bps threshold blocked every
+    # small-cap alert. Tiers roughly match Ross's rule of thumb:
+    #   <$5:  1-2c spread OK, 5c starting to worry (200 bps ≈ 5c on $2.50)
+    #   $5-20: 5c OK, 10c getting wide (100 bps ≈ 10c on $10)
+    #   >$20:  proportional (50 bps ≈ 10c on $20, 50c on $100)
+    # Snapshot-price is used to pick the tier; if unknown we fall back to
+    # `max_spread_bps` (the tightest).
     max_spread_bps: float = 50.0
+    max_spread_bps_under_5: float = 200.0
+    max_spread_bps_under_20: float = 100.0
     require_above_vwap: bool = True
-    min_bid_ask_imbalance: float = 0.55  # bid_share, when L2 available
-    min_tape_buy_pct: float = 0.55       # buy share, when tape available
+    # Imbalance and tape% relaxed from 0.55 to 0.45 for aggressive-mode
+    # trading. On fast small caps these numbers flip second-to-second;
+    # 0.55 blocks tradeable setups on fresh triggers, while 0.45 still
+    # rejects clearly-lopsided sell pressure.
+    min_bid_ask_imbalance: float = 0.45  # bid_share, when L2 available
+    min_tape_buy_pct: float = 0.45       # buy share, when tape available
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,6 +548,8 @@ class FirstPullbackLong(Strategy):
                 "require_1m_positive": self.trend_cfg.require_1m_positive,
                 "require_1m_trigger": self.trend_cfg.require_1m_trigger,
                 "max_spread_bps": self.trend_cfg.max_spread_bps,
+                "max_spread_bps_under_5": self.trend_cfg.max_spread_bps_under_5,
+                "max_spread_bps_under_20": self.trend_cfg.max_spread_bps_under_20,
                 "require_above_vwap": self.trend_cfg.require_above_vwap,
                 "min_bid_ask_imbalance": self.trend_cfg.min_bid_ask_imbalance,
                 "min_tape_buy_pct": self.trend_cfg.min_tape_buy_pct,
@@ -744,19 +781,28 @@ class FirstPullbackLong(Strategy):
             notes["l2_ts"] = "na"
             return True, [], notes
 
-        # Spread
+        # Spread (price-tiered). Use snapshot.mid as the reference price
+        # when available; otherwise fall back to best_bid/best_ask
+        # midpoint; otherwise use the tightest tier as a safe default.
+        ref_price = snapshot.mid
+        if ref_price is None and snapshot.best_bid and snapshot.best_ask:
+            ref_price = (snapshot.best_bid + snapshot.best_ask) / 2.0
+        max_bps = _max_spread_bps_for_price(self.trend_cfg, ref_price)
+
         if snapshot.has_depth and snapshot.spread_bps is not None:
-            if snapshot.spread_bps > self.trend_cfg.max_spread_bps:
+            if snapshot.spread_bps > max_bps:
                 failures.append(
                     GateFailure(
                         GateFailureCategory.MICROSTRUCTURE,
                         (
                             f"spread {snapshot.spread_bps:.1f}bps > max "
-                            f"{self.trend_cfg.max_spread_bps:.1f}bps"
+                            f"{max_bps:.1f}bps"
+                            + (f" (price=${ref_price:.2f})" if ref_price else "")
                         ),
                     )
                 )
             notes["spread_bps"] = snapshot.spread_bps
+            notes["spread_bps_max"] = max_bps
         elif snapshot.has_depth:
             failures.append(
                 GateFailure(
