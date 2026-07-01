@@ -121,4 +121,28 @@ export function resetPortfolioKillSwitch(): Promise<EnginePortfolioStatus> {
   return jsonFetch(`/engine/portfolio/reset_kill_switch`, { method: "POST" });
 }
 
+// ----- DTD observer (scripts/dtd_run.py controlled as subprocess) -----
+
+export interface DtdObserverStatus {
+  running: boolean;
+  pid: number | null;
+  started_at: string | null;
+  last_event_at: string | null;
+  last_event_age_seconds: number | null;
+  log_path: string | null;
+  pidfile_path: string;
+}
+
+export function getDtdObserverStatus(): Promise<DtdObserverStatus> {
+  return jsonFetch(`/dtd/observer/status`);
+}
+
+export function startDtdObserver(): Promise<DtdObserverStatus> {
+  return jsonFetch(`/dtd/observer/start`, { method: "POST" });
+}
+
+export function stopDtdObserver(): Promise<DtdObserverStatus> {
+  return jsonFetch(`/dtd/observer/stop`, { method: "POST" });
+}
+
 export { API_BASE };

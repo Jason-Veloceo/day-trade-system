@@ -105,6 +105,24 @@ export interface EngineDtdContext {
 export type EngineSellAnchor = "bid" | "ask";
 export type EngineTriggerMode = "pullback_break" | "macd_cross";
 
+// One reason an entry gate said no. Matches the backend's
+// `GateFailureCategory` enum + message pair. The UI groups failures by
+// `category` so the trader can tell "still warming up" from
+// "indicator currently negative" from "backside hard veto" at a
+// glance instead of pattern-matching opaque strings.
+export type EngineGateFailureCategory =
+  | "warmup"
+  | "indicator"
+  | "vwap"
+  | "backside"
+  | "trigger"
+  | "microstructure";
+
+export interface GateFailure {
+  category: EngineGateFailureCategory;
+  message: string;
+}
+
 export interface EngineStartIn {
   symbol: string;
   strategy_name: string;
@@ -186,12 +204,23 @@ export interface EngineStatus {
     vwap?: number | null;
     vwap_state?: string | null;
     high_of_day?: number | null;
+    // Reference levels carried from the bootstrap replay. `pmhod` is
+    // today's premarket high (04:00 - 09:30 ET, updates during
+    // premarket); `pdhod` is the most recent prior session's RTH high.
+    // Both are nullable when the bootstrap window didn't cover the
+    // corresponding period.
+    pmhod?: number | null;
+    pdhod?: number | null;
     bars_below_vwap_consecutive?: number | null;
     macd_1m_crossed_down_today?: boolean | null;
     failed_setups_today?: number | null;
     last_entry_gate?: {
       passed: boolean | null;
-      failures: string[];
+      // The current backend emits `{category, message}` per failure so
+      // the UI can group them. Older runs (and the POC
+      // macd_crossover_long strategy) emit plain strings. Both shapes
+      // are accepted here; the renderer handles both.
+      failures: Array<GateFailure | string>;
       notes: Record<string, unknown>;
     } | null;
     last_trigger?: {

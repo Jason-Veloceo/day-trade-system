@@ -64,6 +64,13 @@ export function EngineChart({
   const seenBarsRef = useRef<Set<string>>(new Set());
   const markersStateRef = useRef<SeriesMarker<Time>[]>([]);
   const lastEventIdxRef = useRef<number>(0);
+  // Track the highest time (unix-sec) already written per series so we
+  // can drop strictly-older live updates. lightweight-charts rejects
+  // out-of-order .update() calls with "Cannot update oldest data" and
+  // this is easily triggered by bootstrap-replay events landing after
+  // the historical /bars seed, or by re-connect replay.
+  const lastCandleTimeRef = useRef<number>(0);
+  const lastIndicatorTimeRef = useRef<number>(0);
 
   // 1) Create chart + series once on mount.
   useEffect(() => {
@@ -183,6 +190,19 @@ export function EngineChart({
         sigLineRef.current?.setData(sigLine);
         histRef.current?.setData(histPoints);
         bars.forEach((b) => seenBarsRef.current.add(b.ts));
+        // Establish the high-watermark for live updates.
+        if (candles.length) {
+          lastCandleTimeRef.current = candles[candles.length - 1].time as number;
+        }
+        const lastMacd = macdLine[macdLine.length - 1]?.time as number | undefined;
+        const lastSig = sigLine[sigLine.length - 1]?.time as number | undefined;
+        const lastHist = histPoints[histPoints.length - 1]?.time as number | undefined;
+        lastIndicatorTimeRef.current = Math.max(
+          lastIndicatorTimeRef.current,
+          lastMacd ?? 0,
+          lastSig ?? 0,
+          lastHist ?? 0,
+        );
         chartRef.current?.timeScale().fitContent();
       })
       .catch(() => {
@@ -212,14 +232,20 @@ export function EngineChart({
       if (type === "bar") {
         const ts = String(inner.ts ?? "");
         if (!ts || seenBarsRef.current.has(ts)) continue;
+        const t = tsToTime(ts);
+        if ((t as number) < lastCandleTimeRef.current) {
+          seenBarsRef.current.add(ts);
+          continue;
+        }
         candleRef.current.update({
-          time: tsToTime(ts),
+          time: t,
           open: Number(inner.open),
           high: Number(inner.high),
           low: Number(inner.low),
           close: Number(inner.close),
         });
         seenBarsRef.current.add(ts);
+        lastCandleTimeRef.current = t as number;
         continue;
       }
 
@@ -230,13 +256,16 @@ export function EngineChart({
         // added to seenBarsRef and further ticks for the same ts are no-ops.
         const ts = String(inner.ts ?? "");
         if (!ts || seenBarsRef.current.has(ts)) continue;
+        const t = tsToTime(ts);
+        if ((t as number) < lastCandleTimeRef.current) continue;
         candleRef.current.update({
-          time: tsToTime(ts),
+          time: t,
           open: Number(inner.open),
           high: Number(inner.high),
           low: Number(inner.low),
           close: Number(inner.close),
         });
+        lastCandleTimeRef.current = t as number;
         continue;
       }
 
@@ -245,6 +274,10 @@ export function EngineChart({
         const strat = (inner.strategy ?? {}) as Record<string, unknown>;
         if (!barTs) continue;
         const time = tsToTime(barTs);
+        // Drop strictly-older indicator updates; lightweight-charts
+        // throws "Cannot update oldest data" otherwise. Equal-to-last
+        // is allowed (revision of the same bar).
+        if ((time as number) < lastIndicatorTimeRef.current) continue;
         const macd = strat.macd_line as number | null | undefined;
         const sig = strat.macd_signal as number | null | undefined;
         const hist = strat.macd_histogram as number | null | undefined;
@@ -261,6 +294,7 @@ export function EngineChart({
             color: hist >= 0 ? HIST_POS : HIST_NEG,
           });
         }
+        lastIndicatorTimeRef.current = time as number;
         continue;
       }
 

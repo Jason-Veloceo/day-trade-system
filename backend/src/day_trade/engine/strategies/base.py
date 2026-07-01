@@ -70,6 +70,28 @@ class Strategy(abc.ABC):
         """Update higher-timeframe state. Default no-op."""
         return None
 
+    def on_tick(self, partial: Bar) -> Signal | None:
+        """Evaluate entry conditions against the IN-PROGRESS 1m bar.
+
+        Called by the engine on a sub-bar cadence (default 10 seconds)
+        in addition to the closed-bar `on_bar` path. `partial` is a
+        synthetic Bar with `ts` set to the current 1m bar's close time,
+        and `open/high/low/close/volume` reflecting the running OHLC
+        snapshot at the moment of the tick.
+
+        Implementations MUST be read-only with respect to indicator
+        state (MACD EMA, VWAP cumulative sums, recent-bars buffer,
+        backside latches). Side effects allowed: optimistic
+        `_in_position` latch to prevent intra-tick double-fires, and
+        snapshot-only fields like `_last_entry_gate` / cached pullback
+        info. The next `on_bar` at the actual 1m close is the source
+        of truth for state mutations.
+
+        Default: no-op. Strategies that should never fire mid-candle
+        (e.g. single-timeframe POC strategies) can ignore this.
+        """
+        return None
+
     def mark_entered(self) -> None:
         """Called after an entry fill is confirmed. Default no-op."""
         return None
@@ -81,6 +103,25 @@ class Strategy(abc.ABC):
 
     def record_failed_setup(self) -> None:
         """Called when a trade closed at or below entry. Default no-op."""
+        return None
+
+    def finalize_bootstrap(
+        self, *, pmhod: float | None, pdhod: float | None
+    ) -> None:
+        """Called once by the engine after the historical-bar replay used
+        to warm indicators is complete, immediately before the live
+        BarFeed starts.
+
+        Strategies that maintain intraday latches whose lifetime should
+        be "today's live session only" (not "the replay window") should
+        override this to clear them. Reference levels `pmhod`
+        (today's premarket high so far) and `pdhod` (most recent prior
+        session's RTH high) are computed by the engine from the same
+        historical bars and handed in for the strategy to retain.
+
+        Default: no-op. Strategies that don't care about session-scoped
+        latches (e.g. single-timeframe POC strategies) can ignore this.
+        """
         return None
 
     @abc.abstractmethod

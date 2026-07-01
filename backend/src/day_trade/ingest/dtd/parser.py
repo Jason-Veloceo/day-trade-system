@@ -119,6 +119,17 @@ def parse_alert_response(payload: bytes | str | dict[str, Any]) -> list[RawDtdEv
     return [alert_to_event(a) for a in response.data]
 
 
+def parse_single_alert(body: dict[str, Any]) -> RawDtdEvent:
+    """Parse a single alert body (one element of `DtdAlertResponse.data`).
+
+    Used for the live SharedWorker `scanner/alert/created` message path,
+    which delivers alerts one at a time rather than in a batched response.
+    Payload shape is identical to `/alert?widget=X` `data[i]`.
+    """
+    alert = DtdAlert.model_validate(body)
+    return alert_to_event(alert)
+
+
 def to_scanner_event(raw: RawDtdEvent) -> ScannerEvent:
     """Drop the news payload (it's persisted separately) and expose the persistence shape."""
     return ScannerEvent(

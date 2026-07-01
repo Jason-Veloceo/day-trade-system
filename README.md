@@ -291,7 +291,290 @@ stop at 5.1134 and the 2R target at 5.2683. For the redesigned exit
 framework we should also revisit the legacy 1% fallback — Ross stops
 are structural (last swing low / VWAP / wall), not percentage-based.
 
+### Tue 30 Jun PM session — 10s cadence, auto-arm v1, DTD observer UI, live-channel mystery
+
+Multi-hour session focused on closing the gap between "engine evaluates
+every 1 minute, exits on fixed R-multiples" and Ross-Cameron-style
+high-frequency tape-reading. Three concrete pieces shipped, one deep
+unsolved bug surfaced.
+
+Ports moved to **8010 (backend) / 3010 (frontend)** for this session
+because another local app on the laptop was holding 8000/3000. The
+.env.local update is in place; revert if/when 8000/3000 free up.
+
+**1. Item 1 — 10-second tick cadence (✅ shipped, verified live on AIRJ).**
+
+`TradingEngine` now drives sub-bar evaluations every `eval_tick_seconds`
+(default 10s) off the existing `_on_partial_bar` callback, in addition
+to the existing 1m bar-close path.
+
+- New `Strategy.on_tick(partial: Bar)` default no-op; `FirstPullbackLong`
+  overrides to evaluate the pullback-break trigger mid-candle. It
+  optimistically sets `_in_position` to prevent double-fires within
+  the same candle, but is otherwise **read-only on indicator/latch
+  state** (no MACD/VWAP mutation off ticks).
+- New `ExitTriggerSet.on_tick(partial: Bar)` evaluates the price-driven
+  exits (`hard_stop`, `first_target`, `second_target`) and `l2_distress`
+  using the in-progress bar. **Does NOT touch `ExitState` counters**
+  (`bars_since_entry`, `bars_below_vwap_since_entry`) — those only
+  advance on full bar closes. MACD flip, VWAP loss, tape flip and
+  time stop remain bar-close only.
+- New rate-limited `_on_tick(partial)` on the engine; journals only on
+  signals or decisions (no spam).
+
+Tests: `backend/tests/test_engine_tick.py` covers mid-candle entry,
+no-double-fire-within-candle, exit triggers on partial bars, counter
+non-mutation, and the `eval_tick_seconds` rate limit.
+
+**2. Backside latch pollution fix (✅ shipped + tested).**
+
+Two-day historical bootstrap was unintentionally setting session-level
+latches in `BacksideState` (e.g. `macd_1m_has_crossed_down_today`)
+AND the optimistic `_in_position` flag during replay, causing
+"1m MACD has already crossed down today" rejections on freshly armed
+engines and intermittent "phantom in-position" symptoms. Fixed via:
+
+- New `Strategy.finalize_bootstrap(*, pmhod, pdhod)` called by the
+  engine immediately after the replay loop. Resets session-specific
+  latches and `_in_position` while preserving warmed indicator values.
+- New `_compute_session_levels(bars_1m)` helper: derives Premarket
+  HoD (today 04:00–09:30 ET high) and Previous-day HoD (last prior
+  RTH high) from the replayed history. Both stored on
+  `BacksideState.pmhod` / `pdhod` and surfaced in the UI as new
+  Tile cards on the engine page (next to live HoD).
+- `bootstrap` audit event now includes `pmhod` / `pdhod`.
+
+Tests: `backend/tests/test_engine_bootstrap.py`.
+
+**3. Typed gate failures (✅ shipped + tested).**
+
+`EntryGateResult.failures` and microstructure-gate failures are now
+`list[GateFailure]` with a `GateFailureCategory` enum
+(`WARMUP | INDICATOR | VWAP | BACKSIDE | TRIGGER | MICROSTRUCTURE`),
+not free-text strings. The engine page groups them by category in a
+new `GateFailureList` component so "5m MACD warming" doesn't look the
+same as "backside latched". JSON serialiser updated to walk
+dataclasses + enums; regression test added in
+`test_engine_journal.py`.
+
+**4. Item 2 — Scanner-driven auto-arm worker MVP (✅ shipped + tested,
+~partly verified live).**
+
+Goal from the user: "He hits the small-cap HoD momentum scanner →
+clicks on it → waits for a clean entry. I want THAT, automated." So:
+
+- New `backend/src/day_trade/auto_arm/` module:
+  `policy.py` (pure decision logic), `worker.py` (background polling
+  task), `__init__.py` re-export.
+- New `api/auto_arm.py`: `GET /auto_arm/status`, `POST
+  /auto_arm/enable`, `POST /auto_arm/disable`. The runtime enable/
+  disable mutates the in-memory `Settings.auto_arm_enabled` so the
+  next poll-tick observes the change without restart.
+- New settings (config.py): `AUTO_ARM_*` knobs incl. widgets,
+  strategy, quantity, order type, depth/tape toggles, autonomous
+  mode, daily/hourly/concurrent limits, ET trading window
+  (`04:00–11:30` default), re-arm cooldown (30min), staleness
+  threshold (5min), poll cadence (2s).
+- Worker loop integrated into the FastAPI lifespan; runs whether
+  enabled or not so the toggle is responsive.
+- Frontend: violet `AUTO` badge on sidebar cards for auto-armed
+  engines, with hover-tooltip showing which widgets fired.
+
+Tests: 26 tests in `test_auto_arm_policy.py` covering every gate
+in `decide()` and every branch in `is_engine_stale()`.
+
+**4a. Auto-arm "armed-and-killed-in-12s" bug (✅ fixed, root cause
+analysed and regression-tested).**
+
+First live attempt armed EEIQ and the staleness watcher killed it
+12 seconds later. Root cause: circular logic — the arm path's
+lookback window (5 min) and the staleness threshold (5 min) were
+the same, so a candidate whose `last_alert_at` was 4:48 ago could
+be armed and then immediately stalened out.
+
+Fixes (both shipped):
+- **Tighter arm lookback** — only consider candidates with
+  `last_alert_at` newer than `auto_arm_lookback_seconds` (default
+  **90s**). Must be strictly tighter than the staleness threshold.
+- **Staleness grace period** — `is_engine_stale` will not kill an
+  engine younger than `auto_arm_grace_period_seconds` (default
+  **120s**). Belt-and-braces against the same bug class.
+
+Net effect: even if we arm on a candidate at the very edge of the
+lookback (89s old, alert at T-89s), the engine has the full grace
+period (120s) plus the remaining staleness budget (5min − 89s ≈ 3:31)
+of guaranteed runway. 4 new regression tests in
+`test_auto_arm_policy.py` (now 26 tests passing).
+
+**5. Item 2b — DTD observer subprocess control from the UI (✅
+shipped + tested).**
+
+User pain: "I shouldn't have to run two terminals and remember
+`dtd_login.py` then `dtd_run.py`". Now there's a Start/Stop bar on
+the engine page, with a colour-coded health pill (green/sky/amber/
+rose/neutral) driven by `last_event_age_seconds`.
+
+- New `backend/src/day_trade/dtd_control/controller.py`:
+  `DtdObserverController.start()/stop()/status()`, spawns
+  `scripts/dtd_run.py` via `subprocess.Popen` with `start_new_session=True`
+  so it survives `uvicorn --reload`. PID persists to
+  `var/dtd_observer.pid`; logs to `var/dtd_observer.log`; `waitpid`
+  loop drains zombies after SIGTERM/SIGKILL.
+- New `backend/src/day_trade/api/dtd.py`: `GET /dtd/observer/status`,
+  `POST /dtd/observer/start`, `POST /dtd/observer/stop`.
+- Frontend: new `DtdObserverBar` component on the engine page, polls
+  status every 3s via SWR.
+- `.gitignore` updated to ignore `var/`.
+
+Tests: 9 tests in `test_dtd_controller.py` covering pidfile
+lifecycle, idempotent start, SIGTERM-then-SIGKILL escalation,
+zombie reaping via `os.waitpid(WNOHANG)`, stale-pidfile cleanup,
+missing-script error path. **Stand-in sleep script** is used to
+avoid Playwright/Chromium in the test path.
+
+**Backend test summary at session end: 177 / 177 passing.**
+
+**6. 🔴 UNSOLVED — DTD observer "silent failure" bug (live-channel
+mystery).**
+
+This is the blocker. The user's screenshot during the session
+showed the WT Small-Cap HoD Momo scanner widget firing alerts every
+few seconds (AKTX 11:01:30, FDMT 11:01:21, SOTK x3, TDTH, XHLD, etc),
+but our `scanner_events` table stopped receiving anything ~12+
+minutes earlier. The observer **process is alive** (Playwright
+context responsive) but no new rows land in the DB.
+
+Diagnosis run via `scripts/dtd_diagnose_ws.py` (new this session,
+60-second capture of all HTTP + WS traffic in the persistent
+profile):
+
+- **Hosts seen:** chatroom.warriortrading.com (mostly assets),
+  api-prod.warriortrading.com, scan-prod.warriortrading.com,
+  www.warriortrading.com.
+- **`/alert?widget=X` HTTP responses:** 3 in 60 seconds — ONE per
+  widget (`Running_Up`, `Momo`, custom `E30AE4F9`). Each returns a
+  huge JSON snapshot (`{"count":1666,"data":[...]}` ≈ 1.3 MB for
+  Momo) — i.e. **the full backlog from 04:00 ET to now**, in a
+  single page-load fetch. **Never polled again.**
+- **WebSocket connections to anything WT-related:** ZERO. The only
+  WS seen is `wss://ws.hotjar.com/...` (analytics, unrelated).
+- **No streaming / SSE / chunked endpoint identified** in the 60s
+  window. No `/v2/alert?since=…` polling. `/toplist` was called
+  6 times but appears to drive the "Top Gainers" panel, not the
+  Momo widget.
+
+**This means our `DtdObserver` (which only listens to
+`/alert?widget=` HTTP responses) is architecturally correct for the
+*initial backlog* and architecturally blind to the *live updates*.**
+That's why restarting the observer briefly "works" (reload page →
+re-fetch backlog) then goes silent forever.
+
+What we don't yet know (the diagnostic to re-run tomorrow during
+active scanner activity):
+
+1. Does `/alert?widget=Momo` actually contain events from the last
+   minute when called? (The full-body capture is now wired in
+   `scripts/dtd_diagnose_ws.py` to `playwright_profile/_inspect/alert_bodies/`
+   — inspect the tail of the saved file.)
+2. Is there a **long-polling** request that's pending at capture-end?
+   Diagnostic v2 now also logs `request`-start events, not just
+   completed responses — pending requests will be visible as
+   `http_request` lines without a matching `http` (response) line.
+3. Is the **scanner widget a popup window** that our diagnostic
+   didn't navigate to? The diagnostic just opens the dashboard
+   URL — if the actual scanner is a popup the user clicks through
+   to, our context might be capturing the chatroom shell but not
+   the scanner page's traffic.
+   - Mitigation in v2: capture window is 120s, with a print
+     instruction telling the user to click through to the scanner.
+4. Is the user-visible "live" data actually being computed
+   **client-side** from the backlog (server periodically pushes a
+   small diff over chatroom socket.io) rather than fetched from
+   scan-prod?
+
+**Working hypothesis:** scenario (3) is most likely. The Warrior
+Trading dashboard opens scanner widgets as popups (the user's
+earlier comment "I had to click through to the scanners again"
+strongly implies this). Our `open_dtd_page` just navigates the main
+context; popups are tracked but the user may not actually open the
+Momo popup during the diagnostic window, so the scanner-specific
+endpoint is never hit. Easy to validate tomorrow: re-run the
+diagnostic and explicitly click through to the Momo widget while
+it's running.
+
+**Operational impact:** auto-arm is dependent on this. Until the
+live-channel ingestion is fixed, the worker has nothing fresh to
+arm on (the candidates table only refills from the
+once-per-page-load `/alert` backlog dump). The end-to-end loop
+*ran cleanly when tested with a manually-restarted observer that
+happened to have fresh enough backlog* (EEIQ was armed correctly,
+then killed by the bug we then fixed in #4a), but it's not yet a
+stable scanner-driven auto-arm loop in steady state.
+
+### Tomorrow's plan (priority order)
+
+1. **Pin the live channel.** Premarket / open. Stop any orphan
+   Chromium first (`ps aux | grep -i chromium | grep day-trade`,
+   kill if any). Then:
+   ```
+   cd backend && uv run python ../scripts/dtd_diagnose_ws.py
+   ```
+   When Chromium opens, click through to the actual Momo scanner
+   widget popup and leave it visible. The 120s capture will record
+   every HTTP request (incl. pending long-polls), every WS frame,
+   and save full `/alert` bodies to
+   `playwright_profile/_inspect/alert_bodies/`. Inspect the tail of
+   the Momo body to confirm whether it contains recent (last-60s)
+   events — that decides whether `/alert` is the live channel
+   (just polled rarely) or whether we need a new endpoint.
+2. **Patch `DtdObserver`** to listen on whatever the real live
+   channel turns out to be (long-poll URL, popup-specific endpoint,
+   or a `/v2/alerts/stream` style SSE we haven't seen yet).
+3. **Add a watchdog** to the observer: if `last_event_age_seconds >
+   90` while the process is alive, log a `WARN` and (optional)
+   auto-restart the Playwright context. Prevents the silent-failure
+   mode we hit twice today.
+4. **Resume original pending list** (below) once the live-channel
+   fix is in.
+
 ### Open follow-ups (pick up here)
+
+Last session ended Tue 30 Jun ~23:20 Perth.
+Servers stopped, repo pushed. **Auto-arm v1, 10s tick cadence,
+typed gate failures, observer UI control all shipped.** Live-channel
+mystery for the DTD observer is the immediate blocker (see "Tomorrow's
+plan" above).
+
+**Carry-overs (still open from previous sessions + this one):**
+
+- **Capture qualified-contract metadata** — `qualifyContracts()`
+  returns company name / primary exchange / secType but we don't
+  persist these. User asked for this so the engine header shows
+  "AIRJ — Air Industries Group (NASDAQ)" instead of just `AIRJ`,
+  to confirm we're not accidentally on the wrong instrument.
+  Estimated 1-2 hours.
+- **DECISION NEEDED — relax microstructure thresholds.** Default
+  `max_spread_bps=50`, `imbalance_floor=0.55`, `tape_buy_pct_floor=0.55`
+  are too tight for wide-spread small-caps like AIRJ. Either lower
+  the defaults or make them per-symbol overrideable from the Arm
+  form. User-side decision pending. Estimated 0.5 day.
+- **Item 3 — Scaled entry (3-rung LMT ladder + scale-in).** Ross
+  scales in on confirmation, not all-in on the trigger. Replace the
+  current single-LMT submission with a 3-rung ladder
+  (entry, +N cents, +2N cents) and a scale-in path when structure
+  holds. Estimated 1-2 days.
+- **Item 4 — Verify the tick-level L2 monitor.** The 10s cadence
+  already routes `partial` bars through the exit framework
+  (including `l2_distress`), but we haven't end-to-end-verified
+  that continuous-depth updates from `reqMktDepth` actually drive
+  evaluation at every snapshot, not just at 10s ticks. ~1 day to
+  validate + fix if needed.
+
+Earlier session entry below (kept for context).
+
+---
+
+### (Previous session) Open follow-ups — 26 Jun
 
 Last session ended Fri 26 Jun ~22:50 Perth (Fri US RTH).
 Servers stopped, repo pushed. **v1.3 multi-engine shipped + first

@@ -27,6 +27,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from ..backside import BacksideConfig, BacksideGate, BacksideInputs, BacksideState
@@ -45,12 +46,39 @@ from .base import Bar, Signal, SignalKind, Strategy
 logger = logging.getLogger(__name__)
 
 
+class GateFailureCategory(StrEnum):
+    """Why a gate said no. Drives UI grouping so the user can tell a
+    real veto from "still warming up" or "trigger pattern not yet
+    complete" at a glance.
+    """
+
+    WARMUP = "warmup"               # indicator has not produced its first value
+    INDICATOR = "indicator"         # indicator is warm but value fails the threshold
+    VWAP = "vwap"                   # VWAP-relative condition
+    BACKSIDE = "backside"           # backside gate hard veto or soft score
+    TRIGGER = "trigger"             # entry trigger pattern didn't fire this bar
+    MICROSTRUCTURE = "microstructure"  # L2 / tape / spread last-look (entry-time)
+
+
+@dataclass(frozen=True, slots=True)
+class GateFailure:
+    """One reason a gate said no. `category` lets the UI group failures
+    so "5m MACD warming up" doesn't look the same as "1m MACD currently
+    negative" — which from the trader's POV are very different states."""
+
+    category: GateFailureCategory
+    message: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"category": str(self.category), "message": self.message}
+
+
 @dataclass(slots=True)
 class EntryGateResult:
     """Per-bar decision returned by the entry gate stack."""
 
     passed: bool
-    failures: list[str] = field(default_factory=list)
+    failures: list[GateFailure] = field(default_factory=list)
     notes: dict[str, Any] = field(default_factory=dict)
 
 
@@ -267,6 +295,71 @@ class FirstPullbackLong(Strategy):
             self._macd_5m_prev_hist = self._macd_5m_last.histogram if self._macd_5m_last else None
             self._macd_5m_last = macd_val
 
+    def on_tick(self, partial: Bar) -> Signal | None:
+        """Evaluate entry conditions against the in-progress 1m bar
+        (Ross-aggressive: fire the moment partial.high breaks the
+        pullback level, even mid-candle).
+
+        Read-only on indicator/latch state. Indicators (MACD, VWAP) use
+        their LAST CLOSED VALUES — they're not recomputed against the
+        partial. The partial's price feeds the trigger and the VWAP
+        gate's "close vs vwap" comparison only.
+
+        Returns an ENTER_LONG signal with `extras.is_mid_candle=True`
+        when all gates pass. The engine routes it through the same
+        approval / risk / executor path as a closed-bar signal.
+        """
+        # No entries while already in (or pending) a position.
+        if self._in_position:
+            return None
+
+        # Need at least one closed 1m bar's worth of history before
+        # mid-candle triggers are meaningful (pullback structure has to
+        # come from somewhere).
+        if not self._recent_1m_bars:
+            return None
+
+        result = self._evaluate_entry_gates(partial, is_tick=True)
+        self._last_entry_gate = result
+        if not result.passed:
+            return None
+
+        # All gates passed -> emit. Optimistic in-position latch
+        # mirrors the on_bar path; the engine rolls it back via
+        # `mark_exited()` if microstructure last-look, risk gate, or
+        # portfolio mutex rejects the order.
+        self._in_position = True
+        trig = self._last_trigger_result
+        m1 = self._macd_1m_last
+        m5 = self._macd_5m_last
+        vw = self.vwap.last
+        return Signal(
+            kind=SignalKind.ENTER_LONG,
+            ts=partial.ts,
+            price=partial.close,
+            reason=(
+                f"first_pullback_long ({self.trigger_mode}, mid-candle): "
+                "all entry gates passed"
+            ),
+            extras={
+                "gate_notes": dict(result.notes),
+                "is_mid_candle": True,
+                "macd_1m_hist": m1.histogram if m1 else None,
+                "macd_5m_hist": m5.histogram if m5 else None,
+                "vwap": vw.value if vw else None,
+                "vwap_state": vw.state if vw else "na",
+                "trigger": {
+                    "mode": trig.mode if trig else self.trigger_mode,
+                    "reason": trig.reason if trig else None,
+                    "pullback_test_high": trig.pullback_test_high if trig else None,
+                    "pullback_low": trig.pullback_low if trig else None,
+                    "pullback_bar_count": trig.pullback_bar_count if trig else 0,
+                    "impulse_bar_count": trig.impulse_bar_count if trig else 0,
+                },
+                "stop_suggestion": self.suggest_stop_price(partial),
+            },
+        )
+
     # ---- Helpers consumed by the engine ----
 
     def mark_entered(self) -> None:
@@ -330,12 +423,16 @@ class FirstPullbackLong(Strategy):
             "vwap_state": vw.state if vw else "na",
             "vwap_cum_volume": vw.cum_volume if vw else None,
             "high_of_day": self._high_of_day,
+            "pmhod": self.backside_state.pmhod,
+            "pdhod": self.backside_state.pdhod,
             "bars_below_vwap_consecutive": self.backside_state.bars_below_vwap_consecutive,
             "macd_1m_crossed_down_today": self.backside_state.macd_1m_has_crossed_down_today,
             "failed_setups_today": self.backside_state.failed_setups_today,
             "last_entry_gate": {
                 "passed": last_gate.passed if last_gate else None,
-                "failures": list(last_gate.failures) if last_gate else [],
+                "failures": (
+                    [f.to_dict() for f in last_gate.failures] if last_gate else []
+                ),
                 "notes": dict(last_gate.notes) if last_gate else {},
             },
             "last_trigger": {
@@ -349,6 +446,63 @@ class FirstPullbackLong(Strategy):
             },
             "config": self._config_snapshot(),
         }
+
+    # ---- Bootstrap finalisation ----
+
+    def finalize_bootstrap(
+        self, *, pmhod: float | None, pdhod: float | None
+    ) -> None:
+        """Reset live-session latches/counters after the engine has replayed
+        historical bars to warm indicators.
+
+        The bootstrap replays ~2 trading days of 1m bars through `on_bar`
+        so MACD/VWAP are immediately usable. That same replay, however,
+        also populates per-strategy state as a SIDE EFFECT:
+
+          - BacksideState latches (the
+            `macd_1m_has_crossed_down_today` flag, intraday HOD
+            tracking, VWAP-loss counter, failed-setup tally) get
+            pre-loaded with prior-session activity.
+          - `_in_position` can latch `True` if a replayed bar's gates
+            happened to pass and emit ENTER_LONG. The signal is
+            discarded by the engine but the latch is not — leaving the
+            strategy convinced it's in a position it never opened, so
+            no live entries are evaluated.
+
+        For the live session those side effects are spurious — they
+        describe history, not "today". This method clears them while
+        preserving:
+          - both MACDs (the `_fast`/`_slow`/`_signal` EMA state on the
+            indicator objects themselves),
+          - the previous-histogram trackers (`_macd_*_prev_hist`), so
+            cross-detection on the FIRST live bar uses a real "prev",
+          - VWAP cumulative state (SessionVwap auto-resets at the
+            13:30 UTC RTH boundary; whatever cum_pv/cum_v it carries
+            at this point already reflects the correct anchor),
+          - `_recent_1m_bars` — the buffer's tail is the most-recent
+            premarket bars, which is legitimate structural context for
+            the first live pullback-break detection,
+          - reference levels `pmhod` (today's premarket high so far) and
+            `pdhod` (previous session's RTH high), which are
+            informational features the live session inherits.
+        """
+        self.backside_state.reset_for_new_session()
+        self.backside_state.pmhod = pmhod
+        self.backside_state.pdhod = pdhod
+        # Live-session intraday HOD starts fresh; bootstrap HOD is now
+        # exposed as pmhod/pdhod and no longer drives the post-1030
+        # grace logic against historical highs.
+        self._high_of_day = None
+        # Drop any optimistic in-position latch left over from a
+        # replayed signal that was never actually executed.
+        self._in_position = False
+        # Cached pullback info from the last replayed trigger is stale
+        # — the next live trigger will populate these afresh.
+        self._last_pullback_low = None
+        self._last_pullback_test_high = None
+        self._last_entry_gate = None
+        self._last_trigger_result = None
+        self._last_backside_decision = None
 
     def _config_snapshot(self) -> dict[str, Any]:
         return {
@@ -395,8 +549,22 @@ class FirstPullbackLong(Strategy):
 
     # ---- Gate stack ----
 
-    def _evaluate_entry_gates(self, bar: Bar) -> EntryGateResult:
-        failures: list[str] = []
+    def _evaluate_entry_gates(self, bar: Bar, *, is_tick: bool = False) -> EntryGateResult:
+        """Evaluate the gate stack against `bar`.
+
+        `is_tick=True` means this is a mid-candle evaluation against a
+        SYNTHETIC partial bar that is NOT in `_recent_1m_bars`. The only
+        path that cares about this distinction is the pullback-break
+        trigger, which slices `_recent_1m_bars` to derive the history
+        window — see `_evaluate_trigger`.
+
+        IMPORTANT: this method reads indicator state (MACD, VWAP) and
+        latches (backside_state) but must not mutate them. State
+        mutation belongs to `on_bar`. The only fields this method
+        writes are `_last_*` informational caches (intentional, for
+        the UI snapshot).
+        """
+        failures: list[GateFailure] = []
         notes: dict[str, Any] = {}
 
         # ---- Trend gate (5m) ----
@@ -404,13 +572,23 @@ class FirstPullbackLong(Strategy):
         m5_prev = self._macd_5m_prev_hist
         if self.trend_cfg.require_5m_histogram_positive:
             if m5 is None:
-                failures.append("5m MACD not warmed up yet")
+                failures.append(
+                    GateFailure(GateFailureCategory.WARMUP, "5m MACD not warmed up yet")
+                )
             elif m5.histogram <= 0:
-                failures.append(f"5m MACD histogram <= 0 ({m5.histogram:.6f})")
+                failures.append(
+                    GateFailure(
+                        GateFailureCategory.INDICATOR,
+                        f"5m MACD histogram <= 0 ({m5.histogram:.6f})",
+                    )
+                )
         if self.trend_cfg.require_5m_histogram_not_falling and m5 is not None and m5_prev is not None:
             if m5.histogram < m5_prev:
                 failures.append(
-                    f"5m MACD histogram is falling ({m5_prev:.6f} -> {m5.histogram:.6f})"
+                    GateFailure(
+                        GateFailureCategory.INDICATOR,
+                        f"5m MACD histogram is falling ({m5_prev:.6f} -> {m5.histogram:.6f})",
+                    )
                 )
         notes["macd_5m_hist"] = m5.histogram if m5 else None
         notes["macd_5m_hist_prev"] = m5_prev
@@ -425,11 +603,18 @@ class FirstPullbackLong(Strategy):
             and self.trend_cfg.require_1m_positive
         ):
             if m1 is None:
-                failures.append("1m MACD not warmed up yet")
+                failures.append(
+                    GateFailure(GateFailureCategory.WARMUP, "1m MACD not warmed up yet")
+                )
             elif m1.histogram <= 0:
                 failures.append(
-                    f"1m MACD histogram not positive ({m1.histogram:.6f}); "
-                    "structural trigger requires 1m momentum context"
+                    GateFailure(
+                        GateFailureCategory.INDICATOR,
+                        (
+                            f"1m MACD histogram not positive ({m1.histogram:.6f}); "
+                            "structural trigger requires 1m momentum context"
+                        ),
+                    )
                 )
 
         # ---- VWAP gate ----
@@ -442,7 +627,12 @@ class FirstPullbackLong(Strategy):
                 # Forex / no volume - skip the VWAP gate
                 notes["vwap"] = "na"
             elif vw.state == "below":
-                failures.append(f"price below VWAP ({bar.close:.4f} vs {vw.value:.4f})")
+                failures.append(
+                    GateFailure(
+                        GateFailureCategory.VWAP,
+                        f"price below VWAP ({bar.close:.4f} vs {vw.value:.4f})",
+                    )
+                )
                 notes["vwap"] = vw.value
             else:
                 notes["vwap"] = vw.value
@@ -474,10 +664,12 @@ class FirstPullbackLong(Strategy):
         notes["backside"] = backside_decision.to_dict()
         if backside_decision.block:
             for r in backside_decision.reasons:
-                failures.append(f"backside: {r}")
+                failures.append(
+                    GateFailure(GateFailureCategory.BACKSIDE, f"backside: {r}")
+                )
 
         # ---- Trigger (last gate; the "this bar is the one" check) ----
-        trigger_result = self._evaluate_trigger(bar)
+        trigger_result = self._evaluate_trigger(bar, is_tick=is_tick)
         self._last_trigger_result = trigger_result
         notes["trigger"] = {
             "mode": trigger_result.mode,
@@ -496,17 +688,33 @@ class FirstPullbackLong(Strategy):
                 self._last_pullback_low = trigger_result.pullback_low
                 self._last_pullback_test_high = trigger_result.pullback_test_high
         else:
-            failures.append(f"trigger ({trigger_result.mode}): {trigger_result.reason}")
+            failures.append(
+                GateFailure(
+                    GateFailureCategory.TRIGGER,
+                    f"trigger ({trigger_result.mode}): {trigger_result.reason}",
+                )
+            )
 
         passed = not failures
         return EntryGateResult(passed=passed, failures=failures, notes=notes)
 
-    def _evaluate_trigger(self, bar: Bar) -> TriggerResult:
-        """Dispatch to the configured trigger and return its result."""
+    def _evaluate_trigger(self, bar: Bar, *, is_tick: bool = False) -> TriggerResult:
+        """Dispatch to the configured trigger and return its result.
+
+        For `pullback_break`, the history window is the closed 1m bars
+        STRICTLY BEFORE the candidate bar:
+          - `on_bar` path: the candidate bar was just appended to
+            `_recent_1m_bars`, so history is `_recent_1m_bars[:-1]`.
+          - `on_tick` path: the candidate is the in-progress partial,
+            which is NOT in `_recent_1m_bars`, so the whole buffer is
+            the history window.
+        """
         if self.trigger_mode == self.TRIGGER_MODE_PULLBACK_BREAK:
-            # history is the closed bars BEFORE the current bar; `bar` is
-            # already in `_recent_1m_bars` (appended at top of on_bar).
-            history = self._recent_1m_bars[:-1]
+            history = (
+                list(self._recent_1m_bars)
+                if is_tick
+                else self._recent_1m_bars[:-1]
+            )
             return detect_pullback_break(
                 current_bar=bar,
                 history=history,
@@ -522,7 +730,7 @@ class FirstPullbackLong(Strategy):
 
     def evaluate_microstructure_gates(
         self, *, snapshot: FeatureSnapshot | None
-    ) -> tuple[bool, list[str], dict[str, Any]]:
+    ) -> tuple[bool, list[GateFailure], dict[str, Any]]:
         """Evaluate L2/T&S gates against a feature snapshot. Pure - the
         strategy doesn't store snapshot history.
 
@@ -530,7 +738,7 @@ class FirstPullbackLong(Strategy):
         before submitting an order, so we don't fire if the book deteriorated
         between bar close and order ack.
         """
-        failures: list[str] = []
+        failures: list[GateFailure] = []
         notes: dict[str, Any] = {}
         if snapshot is None:
             notes["l2_ts"] = "na"
@@ -540,19 +748,34 @@ class FirstPullbackLong(Strategy):
         if snapshot.has_depth and snapshot.spread_bps is not None:
             if snapshot.spread_bps > self.trend_cfg.max_spread_bps:
                 failures.append(
-                    f"spread {snapshot.spread_bps:.1f}bps > max "
-                    f"{self.trend_cfg.max_spread_bps:.1f}bps"
+                    GateFailure(
+                        GateFailureCategory.MICROSTRUCTURE,
+                        (
+                            f"spread {snapshot.spread_bps:.1f}bps > max "
+                            f"{self.trend_cfg.max_spread_bps:.1f}bps"
+                        ),
+                    )
                 )
             notes["spread_bps"] = snapshot.spread_bps
         elif snapshot.has_depth:
-            failures.append("no spread observable (book empty)")
+            failures.append(
+                GateFailure(
+                    GateFailureCategory.MICROSTRUCTURE,
+                    "no spread observable (book empty)",
+                )
+            )
 
         # Bid-ask imbalance
         if snapshot.has_depth and snapshot.bid_ask_imbalance is not None:
             if snapshot.bid_ask_imbalance < self.trend_cfg.min_bid_ask_imbalance:
                 failures.append(
-                    f"bid:ask imbalance {snapshot.bid_ask_imbalance:.2f} < min "
-                    f"{self.trend_cfg.min_bid_ask_imbalance:.2f}"
+                    GateFailure(
+                        GateFailureCategory.MICROSTRUCTURE,
+                        (
+                            f"bid:ask imbalance {snapshot.bid_ask_imbalance:.2f} < min "
+                            f"{self.trend_cfg.min_bid_ask_imbalance:.2f}"
+                        ),
+                    )
                 )
             notes["bid_ask_imbalance"] = snapshot.bid_ask_imbalance
 
@@ -560,8 +783,13 @@ class FirstPullbackLong(Strategy):
         if snapshot.has_tape and snapshot.tape_buy_pct_60s is not None:
             if snapshot.tape_buy_pct_60s < self.trend_cfg.min_tape_buy_pct:
                 failures.append(
-                    f"tape buy% {snapshot.tape_buy_pct_60s:.2f} < min "
-                    f"{self.trend_cfg.min_tape_buy_pct:.2f}"
+                    GateFailure(
+                        GateFailureCategory.MICROSTRUCTURE,
+                        (
+                            f"tape buy% {snapshot.tape_buy_pct_60s:.2f} < min "
+                            f"{self.trend_cfg.min_tape_buy_pct:.2f}"
+                        ),
+                    )
                 )
             notes["tape_buy_pct_60s"] = snapshot.tape_buy_pct_60s
 

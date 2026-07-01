@@ -105,7 +105,13 @@ class BacksideInputs:
 @dataclass(slots=True)
 class BacksideState:
     """Mutable per-run state the gate uses. Engine updates fields as it
-    learns from the bar stream. Kept on the strategy."""
+    learns from the bar stream. Kept on the strategy.
+
+    Reference levels (`pmhod` / `pdhod`) are carried separately from the
+    intraday latches because they originate from the bootstrap replay and
+    must survive `reset_for_new_session()` — they describe context the
+    live session inherits, not state the live session generates.
+    """
 
     macd_1m_has_crossed_up_today: bool = False
     macd_1m_has_crossed_down_today: bool = False
@@ -117,7 +123,21 @@ class BacksideState:
     first_30m_volume: float = 0.0
     last_30m_volume: float = 0.0
 
+    # Reference levels carried from the bootstrap replay. These are NOT
+    # cleared by `reset_for_new_session()`; the engine seeds them once at
+    # bootstrap and they're effectively read-only for the live session.
+    #   pmhod: today's premarket high (04:00 - 09:30 ET).
+    #   pdhod: previous-session RTH high (the most-recent prior calendar
+    #          date in ET that has RTH bars in the bootstrap window).
+    pmhod: float | None = None
+    pdhod: float | None = None
+
     def reset_for_new_session(self) -> None:
+        """Reset the intraday latches and counters that are populated by
+        live bar processing. Reference levels (`pmhod`, `pdhod`) and any
+        warm indicator history on the OWNING strategy are intentionally
+        NOT cleared — those are inputs the live session inherits.
+        """
         self.macd_1m_has_crossed_up_today = False
         self.macd_1m_has_crossed_down_today = False
         self.bars_below_vwap_consecutive = 0

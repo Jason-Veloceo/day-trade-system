@@ -104,6 +104,63 @@ class Settings(BaseSettings):
     max_order_rate_per_min: int = 4
     min_seconds_before_open: int = 0
 
+    # --- Auto-arm (Item 2) ---
+    # Background worker that polls the candidates table for newly-passed
+    # scanner alerts and spins up an engine for them. Defaults are
+    # CONSERVATIVE; the global toggle is OFF until you explicitly enable.
+    auto_arm_enabled: bool = False
+    # Comma-separated list of scanner widget names that qualify for
+    # auto-arm. "Momo" = WT Small Cap High of Day Momentum scanner.
+    auto_arm_widgets: str = "Momo"
+    auto_arm_strategy: str = "first_pullback_long"
+    auto_arm_quantity: int = 100
+    auto_arm_order_type: str = "LMT"  # LMT | MKT
+    auto_arm_limit_offset_cents: float = 5.0
+    auto_arm_enable_depth: bool = True
+    auto_arm_enable_tape: bool = True
+    # Fresh movers usually haven't accumulated 26+ 5m bars so the 5m
+    # MACD context gate is OFF by default for auto-armed engines.
+    auto_arm_require_5m_macd: bool = False
+    auto_arm_autonomous: bool = False
+    # Per-engine risk caps when auto-armed. Deliberately tighter than
+    # manual arms because the engine wasn't human-vetted.
+    auto_arm_max_daily_loss_usd: float = 50.0
+    auto_arm_max_trades_per_run: int = 3
+    auto_arm_max_position_value_usd: float = 5000.0
+    auto_arm_max_position_qty: int = 25000
+    # Trading window (ET, HH:MM). Outside this window auto-arm is
+    # silently skipped.
+    auto_arm_window_start_et: str = "04:00"
+    auto_arm_window_end_et: str = "11:30"
+    # Rate limits.
+    auto_arm_max_per_day: int = 10
+    auto_arm_max_per_hour: int = 3
+    # If we auto-arm a symbol and it gets stopped (manually, or by
+    # staleness, or by exit-trigger position close), don't auto-arm it
+    # again for this many minutes.
+    auto_arm_rearm_cooldown_minutes: int = 30
+    # Staleness: if an auto-armed engine's underlying candidate has not
+    # received a new scanner alert within this many minutes AND the
+    # engine is not currently holding a position, the worker auto-stops
+    # it to free a slot for the next mover.
+    auto_arm_stale_after_minutes: int = 5
+    # When fetching candidates for the arm path, only consider alerts
+    # newer than this many seconds. Must be tighter than the staleness
+    # threshold so we don't arm on a candidate that would be
+    # immediately killed by the staleness watcher (the original
+    # "armed and killed within 12s" bug). 90s gives a Ross-style fresh
+    # mover signal while leaving the engine at least
+    # `stale_after_minutes*60 - 90s` of staleness runway.
+    auto_arm_lookback_seconds: float = 90.0
+    # Grace period: the staleness watcher will not kill an auto-armed
+    # engine younger than this many seconds. Belt-and-braces defence
+    # against the same bug — even if we armed on a candidate that was
+    # already near-stale, the engine gets a guaranteed minimum runtime
+    # to bootstrap, evaluate, and decide.
+    auto_arm_grace_period_seconds: float = 120.0
+    # Polling cadence for the worker (DB hit every N seconds).
+    auto_arm_poll_seconds: float = 2.0
+
     @property
     def playwright_profile_path(self) -> Path:
         p = Path(self.dtd_playwright_profile_dir)
@@ -117,6 +174,10 @@ class Settings(BaseSettings):
         if self.dtd_five_pillars_widget:
             widgets.append(self.dtd_five_pillars_widget.strip())
         return widgets
+
+    @property
+    def auto_arm_widget_list(self) -> list[str]:
+        return [w.strip() for w in self.auto_arm_widgets.split(",") if w.strip()]
 
     @model_validator(mode="after")
     def _validate_safety_invariants(self) -> Settings:

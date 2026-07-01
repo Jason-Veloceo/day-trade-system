@@ -151,6 +151,114 @@ class ExitTriggerSet:
     def close(self) -> None:
         self.state = None
 
+    def on_tick(self, inp: ExitEvaluationInputs) -> ExitDecision | None:
+        """Sub-bar exit evaluation against the in-progress 1m bar.
+
+        Called by the engine on the 10s tick path. Checks the
+        PRICE-DRIVEN triggers and the L2 distress trigger, which are
+        the only ones whose decision can become "fire now" between bar
+        boundaries:
+
+          - hard_stop:      partial.low <= stop
+          - second_target:  partial.high >= 2R
+          - first_target:   partial.high >= 1R (partial scale)
+          - l2_distress:    bid:ask imbalance below floor OR ask wall
+                            within risk band (snapshot is real-time)
+
+        Deliberately SKIPPED on the tick path:
+          - macd_flip:     MACD uses last-closed-bar value (stale by
+                           design per spec), no edge information at
+                           10s cadence.
+          - vwap_loss:     requires consecutive-bar count, which only
+                           makes sense on closed-bar cadence.
+          - tape_flip:     requires consecutive-bar count.
+          - time_stop:     bar-count-based.
+
+        IMPORTANT: this method does NOT touch ExitState counters
+        (`bars_since_entry`, `bars_below_vwap_since_entry`,
+        `consecutive_tape_flip_bars`). Those are advanced ONLY by
+        `on_bar` so the "N consecutive bars" semantics stay correct.
+        """
+        s = self.state
+        if s is None:
+            return None
+
+        if self.config.enable_hard_stop and inp.low <= s.stop_price:
+            return ExitDecision(
+                kind=ExitTriggerKind.HARD_STOP,
+                reason=f"low={inp.low:.4f} <= stop={s.stop_price:.4f} (tick)",
+                fraction=1.0,
+                price_observed=s.stop_price,
+            )
+
+        if self.config.enable_second_target and inp.high >= s.second_target:
+            return ExitDecision(
+                kind=ExitTriggerKind.SECOND_TARGET,
+                reason=(
+                    f"high={inp.high:.4f} >= 2R target={s.second_target:.4f} (tick)"
+                ),
+                fraction=1.0,
+                price_observed=s.second_target,
+            )
+
+        if (
+            self.config.enable_first_target
+            and not s.first_target_hit
+            and inp.high >= s.first_target
+        ):
+            s.first_target_hit = True
+            return ExitDecision(
+                kind=ExitTriggerKind.FIRST_TARGET,
+                reason=(
+                    f"high={inp.high:.4f} >= 1R target={s.first_target:.4f} (tick)"
+                ),
+                fraction=self.config.first_target_partial_fraction,
+                price_observed=s.first_target,
+            )
+
+        if self.config.enable_l2_distress and inp.feature_snapshot is not None:
+            f = inp.feature_snapshot
+            if f.has_depth:
+                imbalance = f.bid_ask_imbalance
+                wall_size = f.ask_wall_size
+                wall_bps = f.ask_wall_distance_bps
+                if imbalance is not None and imbalance < self.config.l2_distress_imbalance_floor:
+                    return ExitDecision(
+                        kind=ExitTriggerKind.L2_DISTRESS,
+                        reason=(
+                            f"bid:ask imbalance {imbalance:.2f} below floor "
+                            f"{self.config.l2_distress_imbalance_floor:.2f} (tick)"
+                        ),
+                        fraction=1.0,
+                        price_observed=inp.close,
+                        extras={"imbalance": imbalance},
+                    )
+                if (
+                    wall_size is not None
+                    and wall_bps is not None
+                    and f.ask_size_top is not None
+                    and f.ask_size_top > 0
+                    and wall_size >= f.ask_size_top * self.config.l2_distress_wall_size_multiple
+                    and wall_bps <= self.config.l2_distress_wall_distance_bps
+                ):
+                    return ExitDecision(
+                        kind=ExitTriggerKind.L2_DISTRESS,
+                        reason=(
+                            f"ask wall {wall_size:.0f}@{f.ask_wall_price:.4f} "
+                            f"({wall_bps:.1f}bps above mid) >> top-of-book ask "
+                            f"{f.ask_size_top:.0f} (tick)"
+                        ),
+                        fraction=1.0,
+                        price_observed=inp.close,
+                        extras={
+                            "wall_price": f.ask_wall_price,
+                            "wall_size": wall_size,
+                            "wall_distance_bps": wall_bps,
+                        },
+                    )
+
+        return None
+
     def on_bar(self, inp: ExitEvaluationInputs) -> ExitDecision | None:
         s = self.state
         if s is None:

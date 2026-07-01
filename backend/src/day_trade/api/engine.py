@@ -346,6 +346,69 @@ async def reject(
     return ApprovalOut(handled=get_registry().reject(run_id))
 
 
+class AutonomousPatch(BaseModel):
+    autonomous: bool
+
+
+class AutonomousOut(BaseModel):
+    run_id: int
+    symbol: str
+    autonomous: bool
+
+
+@router.post("/runs/{run_id}/autonomous", response_model=AutonomousOut)
+async def set_run_autonomous(run_id: int, patch: AutonomousPatch) -> AutonomousOut:
+    """Flip a running engine's autonomous flag at runtime.
+
+    Autonomous=True means signals bypass the manual-approval gate and
+    execute directly (subject to normal risk checks). This mutates the
+    live engine's frozen config via `object.__setattr__` so the next
+    signal fire path observes the new value; it also updates the DB
+    row so restarts / audit-logs reflect the change.
+
+    Safety: requires PAPER_TRADING_ONLY=true. In live-trading mode this
+    endpoint refuses so operators can't accidentally bypass approvals on
+    a real-money account via a REST call.
+    """
+    from day_trade.config import get_settings
+
+    settings = get_settings()
+    if not settings.paper_trading_only:
+        raise HTTPException(
+            status_code=403,
+            detail="Runtime autonomous toggle is disabled in live-trading mode",
+        )
+
+    engine = get_registry().engine_for_run_id(run_id)
+    if engine is None:
+        raise HTTPException(
+            status_code=404, detail=f"No active engine for run_id={run_id}"
+        )
+    if not settings.manual_approval_required and patch.autonomous is False:
+        # Not fatal, but worth reporting: system-level default already flat.
+        pass
+
+    # EngineConfig is a frozen dataclass; use object.__setattr__ to mutate
+    # in-place. This is intentional (the alternative would be to swap the
+    # entire config object which would race with any concurrent reader).
+    object.__setattr__(engine.config, "autonomous", patch.autonomous)
+
+    async with session_scope() as s:
+        row = (
+            await s.execute(select(EngineRun).where(EngineRun.id == run_id))
+        ).scalar_one_or_none()
+        if row is not None:
+            row.autonomous = patch.autonomous
+
+    logger.info(
+        "Runtime autonomous flag toggled: run_id=%d symbol=%s autonomous=%s",
+        run_id, engine.config.symbol, patch.autonomous,
+    )
+    return AutonomousOut(
+        run_id=run_id, symbol=engine.config.symbol, autonomous=patch.autonomous
+    )
+
+
 @router.get("/status", response_model=StatusOut)
 async def status() -> StatusOut:
     return StatusOut(**get_registry().status())

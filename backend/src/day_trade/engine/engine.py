@@ -26,7 +26,8 @@ import datetime as dt
 import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from ib_async import Contract, Ticker
 
@@ -40,7 +41,7 @@ from .bars import BarFeed, PartialBar
 from .executor import Executor
 from .exits import ExitConfig, ExitDecision, ExitEvaluationInputs, ExitTriggerSet
 from .features import FeatureSnapshot, compute_snapshot
-from .ibkr_client import IBKRClient
+from .ibkr_client import IBKRClient, is_permanent_symbol_error
 from .instruments import InstrumentSpec, build_contract
 from .journal import Journal
 from .multitf import HigherTimeframeAggregator
@@ -77,6 +78,10 @@ class _PendingEntry:
     trade: Any                          # ib_async Trade (kept untyped to avoid import cycle)
     quantity: int
     stop_suggestion: float
+    # Handler currently registered with IBKRClient for this order's
+    # error events, if any. Cleared when the order reaches a terminal
+    # state so the client's registry doesn't leak.
+    error_handler: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +125,14 @@ class EngineConfig:
     # = ~130 minutes of trading history). Caveat emptor: trading without the
     # 5m context filter catches more false starts.
     require_5m_macd: bool = True
+    # Sub-bar evaluation cadence. The strategy and the exit framework are
+    # invoked on this clock (rate-limited from IBKR's 5s real-time bar
+    # callbacks) in addition to the 1m bar-close path. 10s matches the
+    # Ross-style intra-candle execution window where the pullback-break
+    # trigger should fire the instant price ticks above the test high,
+    # and where L2 distress should bail before the minute is up. Set to
+    # 0 to disable tick evaluation (legacy 1m-only behaviour).
+    eval_tick_seconds: float = 10.0
     dtd_context: dict[str, Any] = field(default_factory=dict)
 
 
@@ -162,6 +175,12 @@ class TradingEngine:
         # Open-position bookkeeping for exit triggers (we own the entry context).
         self._entry_price: float | None = None
         self._entry_ts: dt.datetime | None = None
+
+        # Wall-clock timestamp of the most recent sub-bar evaluation
+        # tick. Used to rate-limit `_on_tick` from the 5s partial-bar
+        # callback path down to `config.eval_tick_seconds` (default
+        # 10s).
+        self._last_tick_eval_at: dt.datetime | None = None
 
         # True iff WE currently hold the portfolio mutex. Used to ensure
         # we only release a mutex we ourselves acquired (defense-in-depth
@@ -403,6 +422,15 @@ class TradingEngine:
 
         # Replay 1m bars into the strategy. Discard any emitted signals -
         # they are based on stale data and must not be acted upon.
+        #
+        # IMPORTANT: `strategy.on_bar` has side effects beyond indicator
+        # state (notably the BacksideState latches in FirstPullbackLong).
+        # We let those side effects accumulate here, then call
+        # `finalize_bootstrap` below to wipe the live-session latches
+        # while preserving warm indicators. Without that clear, the
+        # backside gate's "1m MACD has already crossed down today" latch
+        # would fire immediately on the first live bar because the
+        # replay almost certainly contained at least one cross-down.
         for bar in bars_1m:
             _ = self.strategy.on_bar(bar)
 
@@ -412,6 +440,11 @@ class TradingEngine:
         emitted_5m = self.tf5.prime_with_history(bars_1m)
         for bar5m in emitted_5m:
             self.strategy.on_5m_bar(bar5m)
+
+        # Compute reference levels from the replayed bars, then hand them
+        # to the strategy as part of finalising the bootstrap.
+        pmhod, pdhod = _compute_session_levels(bars_1m)
+        self.strategy.finalize_bootstrap(pmhod=pmhod, pdhod=pdhod)
 
         first_ts = bars_1m[0].ts.isoformat() if bars_1m else None
         last_ts = bars_1m[-1].ts.isoformat() if bars_1m else None
@@ -427,13 +460,16 @@ class TradingEngine:
                 "macd_5m_hist_after": snap.get("macd_5m_hist"),
                 "vwap_after": snap.get("vwap"),
                 "vwap_state_after": snap.get("vwap_state"),
+                "pmhod": pmhod,
+                "pdhod": pdhod,
             },
         )
         logger.info(
             "bootstrap complete: replayed %d 1m bars, %d 5m bars; "
-            "macd_1m_hist=%s macd_5m_hist=%s",
+            "macd_1m_hist=%s macd_5m_hist=%s pmhod=%s pdhod=%s",
             len(bars_1m), len(emitted_5m),
             snap.get("macd_1m_hist"), snap.get("macd_5m_hist"),
+            pmhod, pdhod,
         )
 
     async def stop(self, reason: str = "user_stop") -> None:
@@ -597,14 +633,26 @@ class TradingEngine:
             )
 
     async def _on_partial_bar(self, snapshot: PartialBar) -> None:
-        """Publish the in-progress 1m bar's running OHLC for live UI updates.
+        """Publish the in-progress 1m bar's running OHLC for live UI updates
+        AND drive the sub-bar evaluation tick.
 
-        Fires every ~5 seconds (each time a 5s real-time bar arrives). This
-        path is deliberately lightweight: it does NOT touch the DB, NOT call
-        the strategy, NOT update indicators, and NOT trigger any decisions.
-        It exists purely so the engine page can render a live forming candle
-        instead of waiting a full minute between updates. Strategy behaviour
-        remains strictly bar-close driven (see Ross-style spec).
+        Fires every ~5 seconds (each time IBKR emits a new 5s real-time
+        bar). Two concerns:
+
+          1. UI broadcast — unconditionally publish the running OHLC
+             onto `ENGINE_BAR_TICK` so the engine page can render the
+             forming candle live. Cheap (no DB, no strategy mutation).
+
+          2. Sub-bar evaluation — rate-limited at
+             `config.eval_tick_seconds` (default 10s), drive
+             `_on_tick(snapshot)` which:
+               - runs the entry gate stack against the partial bar
+                 (Ross-aggressive mid-candle pullback break) and
+               - re-checks price-driven + L2 exit triggers
+             without touching MACD/VWAP cumulative state or
+             consecutive-bar counters. Per spec: indicators stay on
+             closed-bar cadence (1m / 5m), only the DECISION cadence
+             accelerates.
         """
         if self._stop_event.is_set() or self.run_id is None:
             return
@@ -627,6 +675,98 @@ class TradingEngine:
             )
         except Exception:
             logger.exception("failed to publish bar_tick")
+
+        # Sub-bar evaluation tick. Skip when disabled (eval_tick_seconds
+        # <= 0) or before the rate-limit window has elapsed.
+        cadence = float(self.config.eval_tick_seconds)
+        if cadence <= 0:
+            return
+        now = dt.datetime.now(dt.UTC)
+        last = self._last_tick_eval_at
+        if last is not None and (now - last).total_seconds() < cadence:
+            return
+        self._last_tick_eval_at = now
+        try:
+            await self._on_tick(snapshot)
+        except Exception:
+            logger.exception("_on_tick raised")
+
+    async def _on_tick(self, partial: PartialBar) -> None:
+        """Sub-bar evaluation. Called every `eval_tick_seconds` from
+        `_on_partial_bar`.
+
+        Read-only on indicator state. Routes any emitted signal /
+        exit decision through the existing `_handle_enter` /
+        `_handle_exit_decision` paths so all the downstream concerns
+        (risk gate, microstructure last-look, portfolio mutex,
+        executor, journal) behave identically to the closed-bar path.
+        Adds `"is_mid_candle": True` to the signal extras so the
+        journal can distinguish the two cadences in post-mortem.
+        """
+        if self._stop_event.is_set():
+            return
+        if self.strategy is None or self.risk is None or self.exits is None:
+            return
+
+        # Synthesise a Bar from the partial OHLC. Carries the bar's
+        # close-time (same value the eventual closed Bar will carry),
+        # which keeps timestamps coherent between tick and bar-close
+        # journal entries.
+        synthetic = Bar(
+            ts=partial.ts,
+            open=partial.open,
+            high=partial.high,
+            low=partial.low,
+            close=partial.close,
+            volume=partial.volume,
+        )
+
+        # Build the feature snapshot once and reuse across both paths.
+        snap = self._snapshot_features(synthetic.ts)
+
+        # ---- Exit triggers (if we're in a position) ----
+        if self.risk.state.open_position_qty > 0 and self._entry_price is not None:
+            exit_inputs = self._make_exit_inputs(synthetic, snap)
+            decision = self.exits.on_tick(exit_inputs)
+            if decision is not None:
+                await self._handle_exit_decision(synthetic, decision)
+                # An exit just fired — don't also evaluate an entry on
+                # the same tick. The next tick will reassess cleanly.
+                return
+
+        # ---- Entry tick eval ----
+        signal = self.strategy.on_tick(synthetic)
+        if signal is None:
+            return
+
+        # Real event — now we journal. (No `bar` / `indicator` events;
+        # those are reserved for the closed-bar cadence so the DB
+        # doesn't fill up with 6 tick-eval snapshots per minute.)
+        if self.journal is not None:
+            await self.journal.record(
+                "signal",
+                {
+                    "kind": signal.kind.value,
+                    "ts": signal.ts.isoformat(),
+                    "price": signal.price,
+                    "reason": signal.reason,
+                    "extras": signal.extras or {},
+                    "cadence": "tick",
+                },
+            )
+        if signal.kind == SignalKind.ENTER_LONG:
+            await self._handle_enter(synthetic, signal, snap)
+        elif signal.kind == SignalKind.EXIT_LONG:
+            await self._handle_exit_signal(signal)
+        else:
+            if self.journal is not None:
+                await self.journal.record(
+                    "error",
+                    {
+                        "where": "_on_tick",
+                        "msg": f"unsupported signal kind {signal.kind}",
+                    },
+                )
 
     async def _on_5m_bar(self, bar: Bar) -> None:
         if self._stop_event.is_set() or self.strategy is None or self.journal is None:
@@ -797,6 +937,18 @@ class TradingEngine:
         trade.fillEvent += lambda t, _fill: loop.create_task(self._on_entry_fill(t))
         trade.statusEvent += lambda t: loop.create_task(self._on_entry_status(t))
 
+        # Register a per-order IBKR error handler so we capture the
+        # human-readable rejection text (e.g. "closing-only status")
+        # that arrives on `errorEvent` separately from the terse
+        # `orderStatus.status='Inactive'`. If the text matches a
+        # permanent-symbol pattern we schedule an engine stop so we
+        # don't burn CPU + IBKR quota retrying the same doomed symbol.
+        order_id = int(getattr(trade.order, "orderId", 0) or 0)
+        if order_id > 0 and self.ibkr is not None:
+            handler = self._make_ibkr_order_error_handler(order_id, signal)
+            self.ibkr.register_order_error_handler(order_id, handler)
+            self._pending_entry.error_handler = handler
+
     # --- exit path ---
 
     async def _handle_exit_decision(self, bar: Bar, decision: ExitDecision) -> None:
@@ -925,10 +1077,17 @@ class TradingEngine:
         record the position size on the risk gate. Subsequent partial-fill
         events on the same trade just resize the position to the new
         total filled.
+
+        Race note (TC 2026-07-01 incident): `fillEvent` and `statusEvent`
+        both fire from ib_async around the same time. If `statusEvent`
+        clears `_pending_entry` on `status=Filled` BEFORE this handler
+        runs, we used to bail early and never call `record_open` — the
+        risk gate thought there was no position, the auto-arm staleness
+        watcher then stopped the engine, and the position was orphaned
+        with no exits armed. Fix: `record_open` is now called BEFORE
+        any pending-entry check, and `_on_entry_status` no longer
+        clears `_pending_entry` on fills (that ownership moved here).
         """
-        pe = self._pending_entry
-        if pe is None or pe.trade is not trade:
-            return
         if self.risk is None or self.journal is None:
             return
 
@@ -937,9 +1096,26 @@ class TradingEngine:
         if filled <= 0 or avg_px <= 0.0:
             return
 
-        # Idempotent: record_open just sets the field, so on partial-then-
-        # completion fills we just re-sync to the current total filled.
+        # Sync the position size on the risk gate FIRST so that any
+        # concurrent observer (auto-arm worker, portfolio checks) sees
+        # `has_open_position=True` immediately, even if the promotion
+        # branch below can't run because _pending_entry got cleared.
+        # Idempotent setter: safe on partial-then-completion fills.
         self.risk.record_open(filled)
+
+        pe = self._pending_entry
+        if pe is None or pe.trade is not trade:
+            # Race with _on_entry_status or a stray event on a stale
+            # trade. record_open already ran so the position IS tracked;
+            # we just can't promote (would need pe.signal / stop). Log
+            # and return.
+            logger.warning(
+                "engine.on_entry_fill: no matching pending_entry for order "
+                "id=%s filled=%d avg_px=%.4f; position size recorded but "
+                "promotion (exits.open, entry_price) skipped",
+                getattr(trade.order, "orderId", None), filled, avg_px,
+            )
+            return
 
         if self._entry_price is None:
             # First fill: open exits framework anchored to the ACTUAL fill
@@ -965,9 +1141,14 @@ class TradingEngine:
                         entry_ts=pe.signal.ts,
                         quantity=filled,
                     )
+            # Route through `position_open` (real enum value) so the
+            # event actually persists — `entry_promoted` was silently
+            # rejected by the DB enum, hiding this whole event class
+            # from the audit log.
             await self.journal.record(
-                "entry_promoted",
+                "position_open",
                 {
+                    "kind": "entry_promoted",
                     "ibkr_order_id": getattr(trade.order, "orderId", None),
                     "filled": filled,
                     "avg_fill_price": avg_px,
@@ -979,6 +1160,79 @@ class TradingEngine:
                     ),
                 },
             )
+
+            # Ownership of _pending_entry lifecycle moved here so the
+            # promotion path is atomic w.r.t. the pending_entry state.
+            # Also unregister the per-order error handler now that the
+            # order is fully filled and we don't need to react to
+            # further errors on this reqId.
+            oid = int(getattr(trade.order, "orderId", 0) or 0)
+            handler = pe.error_handler
+            self._pending_entry = None
+            if oid > 0 and handler is not None and self.ibkr is not None:
+                self.ibkr.unregister_order_error_handler(oid, handler)
+
+    def _make_ibkr_order_error_handler(
+        self, order_id: int, signal: Signal
+    ) -> Callable[[int, str], None]:
+        """Build the callback we register with IBKRClient for `order_id`.
+
+        The callback fires from the ib_async thread on any IBKR error
+        addressed to this order (reqId == order_id). It:
+
+          1. Journals the raw error via an asyncio task (async-safe from
+             a sync callback: schedule with `loop.call_soon_threadsafe`).
+          2. Classifies the text as `permanent` or transient. Permanent
+             means retrying the same symbol will fail again — we stop
+             the engine so the arm slot is freed for a tradeable name.
+
+        We deliberately do NOT roll back the strategy latch here; the
+        `_on_entry_status` handler still runs on the same order and
+        owns the rollback so the two code paths don't fight over state.
+        """
+        loop = asyncio.get_running_loop()
+        symbol = self.config.symbol
+
+        def _handler(error_code: int, error_string: str) -> None:
+            permanent = is_permanent_symbol_error(error_string)
+            payload = {
+                "ibkr_order_id": order_id,
+                "symbol": symbol,
+                "code": error_code,
+                "message": error_string,
+                "permanent": permanent,
+                "signal_ts": signal.ts.isoformat(),
+            }
+
+            async def _journal_and_maybe_stop() -> None:
+                if self.journal is not None:
+                    await self.journal.record("error", payload)
+                logger.warning(
+                    "IBKR order error run=%d oid=%d code=%d permanent=%s: %s",
+                    self.run_id or -1, order_id, error_code, permanent, error_string,
+                )
+                if permanent:
+                    # Fire-and-forget stop so we don't block the error
+                    # dispatch (which may still be delivering to other
+                    # handlers). `stop_reason` gets surfaced in the UI.
+                    reason = f"ibkr_permanent_reject:{error_code}:{error_string[:80]}"
+                    asyncio.create_task(self._stop_from_error(reason))
+
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(_journal_and_maybe_stop())
+            )
+
+        return _handler
+
+    async def _stop_from_error(self, reason: str) -> None:
+        """Stop the engine because an unrecoverable error was observed.
+        Safe to call from an error handler — it awaits the normal stop
+        path but swallows any exception so a bad stop doesn't leave the
+        error dispatcher in a bad state."""
+        try:
+            await self.stop(reason=reason)
+        except Exception:
+            logger.exception("stop-from-error failed for reason=%s", reason)
 
     async def _on_entry_status(self, trade: Any) -> None:
         """Called by ib_async on every status change for our pending BUY.
@@ -999,10 +1253,16 @@ class TradingEngine:
         if status in ("cancelled", "apicancelled", "inactive") and filled == 0:
             # Pure cancel with no fill: roll back ALL the entry-side state
             # we set up in _handle_enter.
+            oid = int(getattr(trade.order, "orderId", 0) or 0)
+            handler = pe.error_handler
             self._pending_entry = None
+            # Journal via the existing enum-safe "error" type so the DB
+            # accepts it. (There is no `entry_cancelled_without_fill`
+            # enum value — using it would silently fail the INSERT.)
             await self.journal.record(
-                "entry_cancelled_without_fill",
+                "error",
                 {
+                    "kind": "entry_cancelled_without_fill",
                     "ibkr_order_id": getattr(trade.order, "orderId", None),
                     "status": getattr(trade.orderStatus, "status", None),
                     "filled": filled,
@@ -1017,14 +1277,19 @@ class TradingEngine:
             if self.strategy is not None:
                 self.strategy.mark_exited()
             await self._release_portfolio_mutex(realized_pnl_usd=0.0)
+            if oid > 0 and handler is not None and self.ibkr is not None:
+                self.ibkr.unregister_order_error_handler(oid, handler)
             return
 
-        # Terminal "we have a position" states: clear pending; the in-
-        # position state is now owned by exits + risk.
-        if status == "filled" or (
-            status in ("cancelled", "apicancelled", "inactive") and filled > 0
-        ):
-            self._pending_entry = None
+        # NOTE: Terminal states with fills (`filled` or
+        # `cancelled/inactive` with partial fills) used to clear
+        # `_pending_entry` here. That created a race with
+        # `_on_entry_fill`: if this handler ran first, the fill
+        # handler saw pe=None and bailed without calling
+        # `record_open` / `exits.open`. Ownership of the "fill
+        # succeeded" clear moved to `_on_entry_fill` where it is
+        # atomic with the promotion of position + exit framework
+        # state. See TC 2026-07-01 incident for the full post-mortem.
 
     # --- features ---
 
@@ -1188,3 +1453,64 @@ class TradingEngine:
                 )
         except Exception:
             logger.exception("failed to persist bar_aggregate")
+
+
+# --- module-level helpers ---
+
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _compute_session_levels(
+    bars_1m: list[Bar],
+) -> tuple[float | None, float | None]:
+    """Compute PMHOD and PDHOD from a chronological list of historical
+    1-minute bars used to warm indicators at engine start.
+
+    Definitions:
+      - PMHOD (today's premarket high of day): the highest `high` of any
+        bar whose CLOSE timestamp falls within (04:00, 09:30] ET on the
+        same calendar date (in ET) as the most-recent bar in `bars_1m`.
+        Returns None if no such bars are present (e.g. engine started
+        post-open, or after-hours / weekend with no fresh premarket).
+      - PDHOD (previous-day high of day): the highest `high` of any bar
+        whose CLOSE timestamp falls within (09:30, 16:00] ET on the
+        most-recent calendar date (in ET) strictly earlier than "today"
+        that has any such bars. Returns None if no prior-session RTH
+        bars are present in the replay window.
+
+    Bar close-time convention: the engine appends 1 minute to IBKR's
+    bar-start timestamps, so a close at 09:30:00 ET represents the bar
+    covering [09:29:00, 09:30:00) — i.e. the LAST premarket bar.
+    Accordingly the boundary tests use `<=` on the premarket close and
+    `>` on the RTH start.
+    """
+    if not bars_1m:
+        return None, None
+
+    today_et = bars_1m[-1].ts.astimezone(_ET).date()
+    pm_open = dt.time(4, 0)
+    rth_open = dt.time(9, 30)
+    rth_close = dt.time(16, 0)
+
+    pmhod: float | None = None
+    pdhod_by_date: dict[dt.date, float] = {}
+
+    for b in bars_1m:
+        ts_et = b.ts.astimezone(_ET)
+        d = ts_et.date()
+        t = ts_et.time()
+        if d == today_et:
+            if pm_open < t <= rth_open:
+                pmhod = b.high if pmhod is None else max(pmhod, b.high)
+        elif d < today_et:
+            if rth_open < t <= rth_close:
+                prev = pdhod_by_date.get(d)
+                pdhod_by_date[d] = b.high if prev is None else max(prev, b.high)
+
+    pdhod: float | None = None
+    if pdhod_by_date:
+        most_recent_prior = max(pdhod_by_date)
+        pdhod = pdhod_by_date[most_recent_prior]
+
+    return pmhod, pdhod

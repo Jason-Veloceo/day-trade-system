@@ -10,7 +10,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import update
 
-from day_trade.api import candidates, engine, health, rules, ws
+from day_trade.api import auto_arm, candidates, dtd, engine, health, rules, ws
+from day_trade.auto_arm import get_worker as get_auto_arm_worker
 from day_trade.config import get_settings
 from day_trade.db.models import EngineRun
 from day_trade.db.session import session_scope
@@ -58,7 +59,19 @@ async def lifespan(_app: FastAPI):
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
     await _sweep_orphaned_engine_runs()
-    yield
+
+    # Item 2: scanner-driven auto-arm worker. Polls the candidates
+    # table every `auto_arm_poll_seconds` and arms engines on matching
+    # widget alerts. The global toggle (`AUTO_ARM_ENABLED`) defaults
+    # to False so this is a no-op for operators who haven't opted in.
+    # The worker itself always runs so the toggle is responsive at
+    # runtime without a restart.
+    auto_arm = get_auto_arm_worker()
+    await auto_arm.start()
+    try:
+        yield
+    finally:
+        await auto_arm.stop()
 
 
 def create_app() -> FastAPI:
@@ -69,12 +82,16 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Local dev: allow the Next.js frontend on a different port.
+    # Local dev: allow the Next.js frontend on its default (3000) and on
+    # an alternate port (3010) used when 3000 is occupied by another app
+    # running concurrently on this machine.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
             "http://localhost:3000",
             "http://127.0.0.1:3000",
+            "http://localhost:3010",
+            "http://127.0.0.1:3010",
         ],
         allow_credentials=True,
         allow_methods=["*"],
@@ -85,6 +102,8 @@ def create_app() -> FastAPI:
     app.include_router(candidates.router)
     app.include_router(rules.router)
     app.include_router(engine.router)
+    app.include_router(auto_arm.router)
+    app.include_router(dtd.router)
     app.include_router(ws.router)
 
     _ = settings  # touch settings so import-time errors surface here

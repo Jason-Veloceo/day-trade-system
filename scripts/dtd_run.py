@@ -40,8 +40,24 @@ async def main() -> None:
 
     async with context_session(settings.playwright_profile_path, headless=settings.dtd_headless) as ctx:
         observer = build_observer(ctx)
-        observer.attach()
+        # attach() is now async: it installs the SharedWorker interceptor
+        # (Playwright add_init_script + expose_function) as well as the
+        # HTTP response handler.
+        await observer.attach()
         page = await open_dtd_page(ctx, settings.dtd_login_url)
+
+        # The persistent Chromium profile may restore pre-existing tabs
+        # (e.g. the chatroom popup). Init scripts only apply to future
+        # navigations, so pages restored BEFORE `observer.attach()` still
+        # have an unwrapped `window.SharedWorker`. Reload every open page
+        # so the wrapper is in place before the WT bundle constructs its
+        # scanner SharedWorker.
+        for p in list(ctx.pages):
+            try:
+                await p.reload(wait_until="domcontentloaded")
+            except Exception:
+                logging.exception("Failed to reload page %s during observer bootstrap", p.url)
+
         logging.info("DTD page open at %s. Waiting for alert traffic.", page.url)
         await stop.wait()
         logging.info("Shutting down DTD observer.")

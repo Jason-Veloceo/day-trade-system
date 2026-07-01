@@ -4,24 +4,30 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import useSWR from "swr";
 import {
   approveEngine,
+  type DtdObserverStatus,
   fetcher,
+  getDtdObserverStatus,
   getEngineRunEvents,
   rejectEngine,
   resetPortfolioKillSwitch,
+  startDtdObserver,
   startEngine,
   stopAllEngines,
+  stopDtdObserver,
   stopEngine,
 } from "@/lib/api";
 import type {
   EngineDtdContext,
   EngineEvent,
   EngineFeatureSnapshot,
+  EngineGateFailureCategory,
   EnginePortfolioStatus,
   EngineRegistryStatus,
   EngineRun,
   EngineSlotsStatus,
   EngineStartIn,
   EngineStatus,
+  GateFailure,
   WsMessage,
 } from "@/lib/types";
 import { useBrokerStream } from "@/lib/ws";
@@ -358,6 +364,8 @@ export default function EnginePage() {
         busy={busy}
       />
 
+      <DtdObserverBar />
+
       <PendingApprovalBanner
         status={selectedEngine}
         onApprove={handleApprove}
@@ -500,6 +508,133 @@ function Card({ title, children }: { title: string; children: React.ReactNode })
         <h2 className="text-sm font-semibold text-neutral-700">{title}</h2>
       </div>
       <div className="px-5 py-4">{children}</div>
+    </div>
+  );
+}
+
+// Bar showing DTD live observer (scripts/dtd_run.py) process status
+// plus Start / Stop buttons. The observer is the source of scanner
+// alerts that auto-arm consumes — if it's not running OR if its last
+// event is more than 60s old, auto-arm has nothing to act on. The
+// freshness clock is the most useful signal: the process can be alive
+// but the page/socket can be silently broken (DOM changed, Playwright
+// page closed, etc.).
+function DtdObserverBar() {
+  const { data, mutate, isLoading } = useSWR<DtdObserverStatus>(
+    "/dtd/observer/status",
+    () => getDtdObserverStatus(),
+    { refreshInterval: 3000 },
+  );
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const handleStart = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const s = await startDtdObserver();
+      mutate(s, { revalidate: false });
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "Failed to start observer.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const handleStop = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const s = await stopDtdObserver();
+      mutate(s, { revalidate: false });
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "Failed to stop observer.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const running = data?.running ?? false;
+  const ageSec = data?.last_event_age_seconds ?? null;
+  // Health tiers:
+  //  - running + fresh (< 60s)        -> green
+  //  - running + warming (no events)  -> sky / neutral
+  //  - running + stale (60-300s)      -> amber
+  //  - running + dead (> 300s)        -> rose (silent failure)
+  //  - not running                    -> neutral
+  let healthClasses: string;
+  let dotClasses: string;
+  let healthLabel: string;
+  if (!running) {
+    healthClasses = "border-neutral-200";
+    dotClasses = "bg-neutral-400";
+    healthLabel = "Stopped";
+  } else if (ageSec == null) {
+    healthClasses = "border-neutral-200";
+    dotClasses = "bg-sky-500";
+    healthLabel = "Running (no events yet)";
+  } else if (ageSec < 60) {
+    healthClasses = "border-emerald-200";
+    dotClasses = "bg-emerald-500";
+    healthLabel = `Running · last event ${ageSec.toFixed(0)}s ago`;
+  } else if (ageSec < 300) {
+    healthClasses = "border-amber-300 ring-1 ring-amber-200";
+    dotClasses = "bg-amber-500";
+    healthLabel = `Running · last event ${Math.round(ageSec / 60)}m ago (warming or quiet scanner)`;
+  } else {
+    healthClasses = "border-rose-300 ring-1 ring-rose-200";
+    dotClasses = "bg-rose-500";
+    healthLabel = `Running but SILENT for ${Math.round(ageSec / 60)}m — restart`;
+  }
+
+  return (
+    <div
+      className={
+        "rounded-xl border bg-white px-5 py-3 shadow-sm " + healthClasses
+      }
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="text-xs font-medium uppercase tracking-wider text-neutral-500">
+            DTD observer
+          </div>
+          <div className="flex items-center gap-2 text-sm">
+            <span className={"inline-block h-2 w-2 rounded-full " + dotClasses} />
+            <span className="text-neutral-800">{healthLabel}</span>
+            {data?.pid != null ? (
+              <span className="font-mono text-xs text-neutral-500">pid={data.pid}</span>
+            ) : null}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {running ? (
+            <button
+              type="button"
+              onClick={handleStop}
+              disabled={busy || isLoading}
+              className="inline-flex h-8 items-center justify-center rounded-md border border-neutral-300 bg-white px-3 text-xs font-medium text-neutral-700 shadow-sm hover:bg-neutral-50 disabled:opacity-50"
+            >
+              {busy ? "Stopping…" : "Stop observer"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleStart}
+              disabled={busy || isLoading}
+              className="inline-flex h-8 items-center justify-center rounded-md border border-emerald-300 bg-emerald-50 px-3 text-xs font-medium text-emerald-700 shadow-sm hover:bg-emerald-100 disabled:opacity-50"
+            >
+              {busy ? "Starting…" : "Start observer"}
+            </button>
+          )}
+        </div>
+      </div>
+      {err ? (
+        <div className="mt-2 text-xs text-rose-700">{err}</div>
+      ) : null}
+      {running && data?.log_path ? (
+        <div className="mt-1 text-[10px] font-mono text-neutral-400">
+          log: {data.log_path}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -787,6 +922,19 @@ function EngineSidebarCard({
             {engine.symbol}
           </span>
           <div className="flex items-center gap-1">
+            {engine.dtd_context?.auto_armed ? (
+              <span
+                title={
+                  "Auto-armed by scanner" +
+                  (engine.dtd_context?.auto_arm_widgets
+                    ? ` (widgets: ${(engine.dtd_context.auto_arm_widgets as string[]).join(", ")})`
+                    : "")
+                }
+                className="inline-flex items-center rounded-full bg-violet-100 px-1.5 text-[10px] font-semibold uppercase tracking-wider text-violet-700 ring-1 ring-violet-200"
+              >
+                Auto
+              </span>
+            ) : null}
             {isMutexHolder ? (
               <span
                 title="This engine currently holds the portfolio execution mutex"
@@ -1519,41 +1667,73 @@ function StrategyStatePanel({ status }: { status: EngineStatus | undefined }) {
           <Tile label="1m signal line" value={fmt(ss.macd_signal)} accent="neutral" />
         </div>
       ) : (
-        <div className="grid grid-cols-3 gap-3">
-          <Tile
-            label="1m hist"
-            value={fmt(macd1m)}
-            accent={
-              macd1m === null || macd1m === undefined
-                ? "neutral"
-                : macd1m > 0
-                ? "emerald"
-                : "rose"
-            }
-          />
-          <Tile
-            label="5m hist"
-            value={fmt(macd5m)}
-            accent={
-              macd5m === null || macd5m === undefined
-                ? "neutral"
-                : macd5m > 0
-                ? "emerald"
-                : "rose"
-            }
-          />
-          <Tile
-            label="VWAP"
-            value={fmt2(ss.vwap)}
-            accent={
-              ss.vwap_state === "above"
-                ? "emerald"
-                : ss.vwap_state === "below"
-                ? "rose"
-                : "neutral"
-            }
-          />
-        </div>
+        <>
+          <div className="grid grid-cols-3 gap-3">
+            <Tile
+              label="1m hist"
+              value={fmt(macd1m)}
+              accent={
+                macd1m === null || macd1m === undefined
+                  ? "neutral"
+                  : macd1m > 0
+                  ? "emerald"
+                  : "rose"
+              }
+            />
+            <Tile
+              label="5m hist"
+              value={fmt(macd5m)}
+              accent={
+                macd5m === null || macd5m === undefined
+                  ? "neutral"
+                  : macd5m > 0
+                  ? "emerald"
+                  : "rose"
+              }
+            />
+            <Tile
+              label="VWAP"
+              value={fmt2(ss.vwap)}
+              accent={
+                ss.vwap_state === "above"
+                  ? "emerald"
+                  : ss.vwap_state === "below"
+                  ? "rose"
+                  : "neutral"
+              }
+            />
+          </div>
+          {/* PMHOD / PDHOD / HOD reference levels carried from the
+              bootstrap replay. Rendered as a second strip so the
+              MACD/VWAP focus row above stays uncluttered. Hidden
+              entirely when none of the three has a value (legacy runs,
+              very fresh tickers with no bootstrap data). */}
+          {ss.pmhod !== undefined ||
+          ss.pdhod !== undefined ||
+          ss.high_of_day !== undefined ? (
+            <div className="grid grid-cols-3 gap-3">
+              <Tile
+                label="PMHOD (today)"
+                value={fmt2(ss.pmhod ?? null)}
+                accent={ss.pmhod === null || ss.pmhod === undefined ? "neutral" : "sky"}
+              />
+              <Tile
+                label="PDHOD (prior session)"
+                value={fmt2(ss.pdhod ?? null)}
+                accent={ss.pdhod === null || ss.pdhod === undefined ? "neutral" : "sky"}
+              />
+              <Tile
+                label="HOD (live session)"
+                value={fmt2(ss.high_of_day ?? null)}
+                accent={
+                  ss.high_of_day === null || ss.high_of_day === undefined
+                    ? "neutral"
+                    : "emerald"
+                }
+              />
+            </div>
+          ) : null}
+        </>
       )}
       {ss.last_trigger ? (
         <div className="rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
@@ -1608,11 +1788,7 @@ function StrategyStatePanel({ status }: { status: EngineStatus | undefined }) {
             {ss.last_entry_gate.passed ? (
               <span className="text-emerald-700">PASSED</span>
             ) : ss.last_entry_gate.failures.length > 0 ? (
-              <ul className="list-disc pl-4 text-rose-700">
-                {ss.last_entry_gate.failures.map((f: string, i: number) => (
-                  <li key={i}>{f}</li>
-                ))}
-              </ul>
+              <GateFailureList failures={ss.last_entry_gate.failures} />
             ) : (
               <span className="text-neutral-600">no eval yet</span>
             )}
@@ -1886,7 +2062,11 @@ function summarise(type: string, p: Record<string, unknown>): string {
         return `EXIT ${p.kind}: ${p.reason}`;
       }
       if (stage === "microstructure_gate") {
-        return `microstructure ${p.passed ? "PASS" : "FAIL"}: ${(p.failures as string[] | undefined)?.join("; ") ?? ""}`;
+        const raw = (p.failures as Array<GateFailure | string> | undefined) ?? [];
+        const parts = raw.map((f) =>
+          typeof f === "string" ? f : `[${f.category}] ${f.message}`,
+        );
+        return `microstructure ${p.passed ? "PASS" : "FAIL"}: ${parts.join("; ")}`;
       }
       return `${stage} qty=${p.qty ?? "-"}`;
     }
@@ -2072,6 +2252,130 @@ function Tile({
     <div className={"rounded-md px-3 py-2 ring-1 " + ringClass}>
       <div className="text-[10px] font-semibold uppercase tracking-wide opacity-70">{label}</div>
       <div className="mt-0.5 font-mono text-sm">{value}</div>
+    </div>
+  );
+}
+
+// ---------- gate-failure rendering ----------
+
+// Order in which categories are shown. Warm-up first because it's the
+// "things are still booting" state; trigger last because it's normally
+// the most ephemeral signal ("next bar might fire").
+const GATE_FAILURE_CATEGORY_ORDER: EngineGateFailureCategory[] = [
+  "warmup",
+  "indicator",
+  "vwap",
+  "backside",
+  "microstructure",
+  "trigger",
+];
+
+const GATE_FAILURE_CATEGORY_LABEL: Record<EngineGateFailureCategory, string> = {
+  warmup: "Warming up",
+  indicator: "Indicator state",
+  vwap: "VWAP",
+  backside: "Backside veto",
+  microstructure: "L2 / tape / spread",
+  trigger: "Trigger not fired",
+};
+
+// Tailwind colour classes per category. Warm-up is amber (transitional,
+// not a real veto); indicator/vwap/microstructure are sky (factual
+// state, not a flaw); backside is rose (hard veto); trigger is neutral
+// (waiting for the next bar to do its thing).
+const GATE_FAILURE_CATEGORY_CLASSES: Record<EngineGateFailureCategory, string> = {
+  warmup: "border-amber-200 bg-amber-50 text-amber-800",
+  indicator: "border-sky-200 bg-sky-50 text-sky-800",
+  vwap: "border-sky-200 bg-sky-50 text-sky-800",
+  microstructure: "border-sky-200 bg-sky-50 text-sky-800",
+  backside: "border-rose-200 bg-rose-50 text-rose-800",
+  trigger: "border-neutral-200 bg-neutral-50 text-neutral-700",
+};
+
+const GATE_FAILURE_CATEGORIES = new Set<EngineGateFailureCategory>([
+  "warmup",
+  "indicator",
+  "vwap",
+  "backside",
+  "microstructure",
+  "trigger",
+]);
+
+// Heuristic that maps the legacy raw-string failure shape onto a
+// category. Used for engine_runs that completed BEFORE the backend was
+// emitting tagged failures; new runs come in tagged so this is purely a
+// backwards-compat path. Falls back to "indicator" when nothing
+// matches — better than "unknown" because the user will at least see it
+// rendered in the same place as the other indicator messages.
+function categoriseLegacyFailure(s: string): EngineGateFailureCategory {
+  const lower = s.toLowerCase();
+  if (lower.includes("not warmed up")) return "warmup";
+  if (lower.startsWith("backside:")) return "backside";
+  if (lower.startsWith("trigger ")) return "trigger";
+  if (lower.includes("vwap")) return "vwap";
+  if (
+    lower.includes("spread") ||
+    lower.includes("imbalance") ||
+    lower.includes("tape")
+  ) {
+    return "microstructure";
+  }
+  return "indicator";
+}
+
+function normaliseGateFailure(
+  f: GateFailure | string,
+): GateFailure {
+  if (typeof f === "string") {
+    return { category: categoriseLegacyFailure(f), message: f };
+  }
+  // Defensive: backend could in principle send a category we don't know
+  // about (e.g. after a backend-only update). Treat unknowns as
+  // "indicator" so they still render.
+  if (!GATE_FAILURE_CATEGORIES.has(f.category)) {
+    return { category: "indicator", message: f.message };
+  }
+  return f;
+}
+
+function GateFailureList({
+  failures,
+}: {
+  failures: Array<GateFailure | string>;
+}) {
+  const grouped = new Map<EngineGateFailureCategory, string[]>();
+  for (const raw of failures) {
+    const { category, message } = normaliseGateFailure(raw);
+    const arr = grouped.get(category);
+    if (arr) arr.push(message);
+    else grouped.set(category, [message]);
+  }
+  const ordered = GATE_FAILURE_CATEGORY_ORDER.filter((c) => grouped.has(c));
+  return (
+    <div className="space-y-1.5">
+      {ordered.map((cat) => {
+        const messages = grouped.get(cat) ?? [];
+        return (
+          <div
+            key={cat}
+            className={
+              "rounded border px-2 py-1.5 " +
+              GATE_FAILURE_CATEGORY_CLASSES[cat]
+            }
+          >
+            <div className="text-[10px] font-semibold uppercase tracking-wide opacity-80">
+              {GATE_FAILURE_CATEGORY_LABEL[cat]}
+            </div>
+            <ul className="mt-0.5 list-disc space-y-0.5 pl-4">
+              {messages.map((m, i) => (
+                <li key={i} className="leading-snug">
+                  {m}
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })}
     </div>
   );
 }

@@ -40,7 +40,11 @@ export default function Watchlist() {
         {isLoading && <div className="p-4 text-sm text-neutral-500">Loading…</div>}
         {error && (
           <div className="p-4 text-sm text-rose-700">
-            Failed to load candidates. Is the backend running on :8000?
+            Failed to load candidates. Is the backend running at{" "}
+            <code className="font-mono">
+              {process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000"}
+            </code>
+            ?
           </div>
         )}
         {data?.length === 0 && (

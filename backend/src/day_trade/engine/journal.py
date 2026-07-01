@@ -13,7 +13,9 @@ The journal is engine-instance-scoped (one Journal per EngineRun).
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+import enum
 import json
 import logging
 from decimal import Decimal
@@ -58,10 +60,23 @@ _TOPIC_MAP: dict[str, str] = {
 
 
 def _jsonable(obj: Any) -> Any:
-    """Convert a payload into something JSON-serialisable."""
+    """Convert a payload into something JSON-serialisable.
+
+    Handles the union of types that flow through the engine's event
+    payloads:
+
+      - primitive containers (dict, list, tuple, set, frozenset)
+      - Decimal -> str (preserves precision)
+      - datetime / date -> ISO 8601
+      - dataclass instances -> dict via dataclasses.asdict (recursive)
+      - Enum members -> their `.value`
+      - everything else passed through (json.dumps will raise if it
+        can't be encoded, and the caller will fall back to the
+        diagnostic envelope).
+    """
     if isinstance(obj, dict):
         return {k: _jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, (list, tuple, set, frozenset)):
         return [_jsonable(v) for v in obj]
     if isinstance(obj, Decimal):
         return str(obj)
@@ -69,6 +84,14 @@ def _jsonable(obj: Any) -> Any:
         return obj.isoformat()
     if isinstance(obj, dt.date):
         return obj.isoformat()
+    if isinstance(obj, enum.Enum):
+        return obj.value
+    # dataclasses.is_dataclass is True for both classes AND instances;
+    # we only want to convert instances. `asdict` does a deep copy
+    # recursively, but it does NOT know about Enum / Decimal / datetime,
+    # so we re-run _jsonable over the resulting dict.
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return _jsonable(dataclasses.asdict(obj))
     return obj
 
 

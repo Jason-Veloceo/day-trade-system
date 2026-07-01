@@ -50,6 +50,47 @@ class IBKRSubscriptionError(RuntimeError):
     """Raised when an L2/T&S subscription fails (e.g. no entitlements)."""
 
 
+# Text patterns (case-insensitive substrings) that indicate an IBKR
+# rejection which is PERMANENT for the symbol in the current session.
+# When we see one of these on an order, retrying the same symbol is
+# guaranteed to fail — we auto-stop the engine to save capacity for
+# tradeable symbols. Extend as we encounter new patterns in production
+# logs.
+_PERMANENT_ORDER_ERROR_PATTERNS: tuple[str, ...] = (
+    "closing-only",
+    "closing only",
+    "closing-only status",
+    "not eligible",
+    "not tradable",
+    "not available for trading",
+    "no security definition",
+    "security definition has expired",
+    "hard to borrow",
+    "no shares available",
+)
+
+# IBKR error codes that are pure info / warnings and MUST NOT be
+# treated as order-fatal (they arrive on the same errorEvent stream as
+# real errors). 2103/2104/2105/2106/2158 are farm-connection status;
+# 2109 is order events warning about routing; 399 is generic warning.
+_IBKR_INFO_CODES: frozenset[int] = frozenset({
+    2103, 2104, 2105, 2106, 2107, 2108, 2109, 2158, 202, 399,
+})
+
+
+def is_permanent_symbol_error(text: str) -> bool:
+    """Return True if the IBKR error text indicates the symbol cannot
+    be traded further this session. Case-insensitive substring match."""
+    if not text:
+        return False
+    lower = text.lower()
+    return any(pat in lower for pat in _PERMANENT_ORDER_ERROR_PATTERNS)
+
+
+# Signature of a per-order error handler: (errorCode, errorString) -> None.
+OrderErrorHandler = Callable[[int, str], None]
+
+
 class IBKRClient:
     """Process-wide IBKR client. Singleton; do not instantiate directly -
     call `get_ibkr_client()`."""
@@ -62,6 +103,85 @@ class IBKRClient:
         # Concurrency guard: connect() is idempotent and safe to call from
         # multiple engine start requests at once.
         self._connect_lock = asyncio.Lock()
+        # Per-order-id error handler registry. `errorEvent` fires with
+        # reqId == the ibkr orderId for order-scoped errors, and the
+        # engine registers a handler per submitted BUY so it can react
+        # to rejections (e.g. "closing-only"). We use a list to allow
+        # both the engine and the executor to subscribe; ordering is
+        # insertion order.
+        self._order_error_handlers: dict[int, list[OrderErrorHandler]] = {}
+        self._error_event_bound = False
+
+    def _bind_error_event(self) -> None:
+        """Attach the central error dispatcher to `_ib.errorEvent`.
+        Called once after the first successful connect. Idempotent."""
+        if self._error_event_bound:
+            return
+        self._ib.errorEvent += self._dispatch_error
+        self._error_event_bound = True
+
+    def _dispatch_error(
+        self,
+        reqId: int,
+        errorCode: int,
+        errorString: str,
+        contract: Contract | None = None,
+    ) -> None:
+        """Route `errorEvent` to registered per-order handlers.
+
+        ib_async fires `errorEvent(reqId, errorCode, errorString, contract)`.
+        For order-scoped errors reqId == orderId; for connection-scoped
+        events reqId is -1 or an internal request id. We only dispatch
+        to per-order handlers when reqId matches a registered orderId.
+        Info-only codes (farm status, warnings) are logged at DEBUG so
+        they don't spam the run journal.
+        """
+        if errorCode in _IBKR_INFO_CODES:
+            logger.debug(
+                "ibkr info reqId=%s code=%s msg=%s", reqId, errorCode, errorString
+            )
+            return
+        handlers = self._order_error_handlers.get(reqId)
+        if not handlers:
+            logger.info(
+                "ibkr error (unrouted) reqId=%s code=%s msg=%s",
+                reqId, errorCode, errorString,
+            )
+            return
+        for h in handlers:
+            try:
+                h(errorCode, errorString)
+            except Exception:
+                logger.exception(
+                    "order error handler raised for reqId=%s code=%s",
+                    reqId, errorCode,
+                )
+
+    def register_order_error_handler(
+        self, order_id: int, handler: OrderErrorHandler
+    ) -> None:
+        """Register `handler` to receive IBKR errors for `order_id`.
+        Multiple handlers per order are allowed and dispatched in
+        insertion order. Unregister via `unregister_order_error_handler`
+        when the order reaches a terminal state to avoid leaks."""
+        self._order_error_handlers.setdefault(order_id, []).append(handler)
+
+    def unregister_order_error_handler(
+        self, order_id: int, handler: OrderErrorHandler | None = None
+    ) -> None:
+        """Remove `handler` (or all handlers if None) for `order_id`."""
+        if handler is None:
+            self._order_error_handlers.pop(order_id, None)
+            return
+        lst = self._order_error_handlers.get(order_id)
+        if not lst:
+            return
+        try:
+            lst.remove(handler)
+        except ValueError:
+            pass
+        if not lst:
+            self._order_error_handlers.pop(order_id, None)
 
     # --- lifecycle ---
 
@@ -113,6 +233,7 @@ class IBKRClient:
             self._ib.reqMarketDataType(s.ibkr_market_data_type_code)
             self._connected = True
             self._account = account
+            self._bind_error_event()
             logger.info(
                 "IBKR connected: account=%s mdt=%s client_id=%s",
                 account,

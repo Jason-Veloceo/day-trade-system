@@ -500,8 +500,16 @@ async def test_entry_cancelled_without_fill_does_not_open_position() -> None:
     assert engine.exits.state is None
     # Strategy unlatched so it can try again on the next signal
     assert strategy.in_position is False
-    # Journaled for the audit trail
-    cancels = journal.payloads_for("entry_cancelled_without_fill")
+    # Journaled for the audit trail. The event now uses the `error`
+    # event_type (which the DB enum accepts) with `kind` in the payload
+    # so we discriminate below. Previously we used an ad-hoc
+    # `entry_cancelled_without_fill` event_type which the DB enum did
+    # NOT accept — the INSERT silently failed in production while this
+    # test (fake journal) passed. See journal.py `_TOPIC_MAP`.
+    cancels = [
+        p for p in journal.payloads_for("error")
+        if p.get("kind") == "entry_cancelled_without_fill"
+    ]
     assert len(cancels) == 1
 
 
@@ -527,6 +535,56 @@ async def test_entry_first_fill_opens_exits_with_actual_fill_price() -> None:
     assert engine.risk.state.open_position_qty == 10
     assert engine.exits.state is not None
     assert engine.exits.state.entry_price == 100.05
+
+
+@pytest.mark.asyncio
+async def test_status_filled_before_fill_event_does_not_orphan_position() -> None:
+    """Regression: TC 2026-07-01 incident.
+
+    ib_async fires `fillEvent` and `statusEvent(Filled)` on the SAME
+    Trade around the same time. Both handlers schedule via
+    `loop.create_task`, so the ordering between `_on_entry_fill` and
+    `_on_entry_status(Filled)` is racy. In the incident, statusEvent
+    ran first and cleared `_pending_entry`; the subsequent fill
+    handler then bailed on `pe is None`, never calling `record_open`
+    or `exits.open`. Result: 100 TC filled at IBKR but the engine's
+    `open_position_qty=0` and no exit framework armed. The auto-arm
+    staleness watcher then killed the engine 7s later, leaving an
+    orphaned paper position.
+
+    Fix: `record_open` runs BEFORE the pending_entry guard, and the
+    "clear _pending_entry on Filled" branch moved out of
+    `_on_entry_status` and into `_on_entry_fill` where it's atomic
+    with the position promotion. This test exercises the exact race
+    ordering that caused the incident.
+    """
+    engine, _, _, _, _ = _build_engine()
+    await engine._handle_enter(_bar_at(close=100.0), _signal_at(price=100.0), snap=None)
+    pe = engine._pending_entry
+    assert pe is not None
+    trade = pe.trade
+    trade.orderStatus.status = "Filled"
+    trade.orderStatus.filled = 10.0
+    trade.orderStatus.avgFillPrice = 100.05
+
+    # Race: statusEvent handler fires FIRST (used to clear
+    # _pending_entry → break the fill handler).
+    await engine._on_entry_status(trade)
+    # Now fillEvent handler fires.
+    await engine._on_entry_fill(trade)
+
+    # Position must still be tracked, exits armed, entry price set —
+    # regardless of the handler ordering.
+    assert engine.risk.state.open_position_qty == 10, (
+        "record_open was skipped due to the fillEvent/statusEvent race; "
+        "the engine believes it has no position while IBKR shows a fill."
+    )
+    assert engine._entry_price == 100.05
+    assert engine.exits.state is not None
+    assert engine.exits.state.entry_price == 100.05
+    # _pending_entry should be cleared by the fill handler (now the sole
+    # owner of that lifecycle).
+    assert engine._pending_entry is None
 
 
 @pytest.mark.asyncio
